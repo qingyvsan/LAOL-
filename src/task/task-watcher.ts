@@ -14,6 +14,7 @@ import type { Task } from "../data/models";
 
 export class TaskWatcher {
   private watcher: FSWatcher | null = null;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
   private taskStore: TaskStore;
   private eventBus: EventBus;
   private tasksDir: string;
@@ -34,8 +35,11 @@ export class TaskWatcher {
     }
 
     this.watcher = watch(this.tasksDir, {
-      // Only watch JSON files
-      ignored: /(^|[\/\\])\../, // dotfiles
+      // Only ignore files whose basename starts with "." (dotfiles / temp files).
+      // IMPORTANT: the old regex /(^|[\/\\])\../ also matched directories like
+      // ".multiagent" (the "\.m" after "\" in the path), causing chokidar to
+      // silently ignore the entire tasks/ directory. Using a function avoids this.
+      ignored: (testPath: string) => path.basename(testPath).startsWith("."),
       persistent: true,
       ignoreInitial: true, // don't fire for existing files on start
       awaitWriteFinish: {
@@ -43,6 +47,17 @@ export class TaskWatcher {
         pollInterval: 50,
       },
     });
+
+    // Safety-net fallback: periodically rescan for pending tasks.
+    // On Windows/NTFS, chokidar may occasionally miss atomic-rename events,
+    // and atomicWrite (tmp → renameSync) can be invisible on some file systems.
+    // A cheap directory listing every few seconds guarantees no task is missed.
+    this.pollTimer = setInterval(() => {
+      const pending = this.taskStore.listTasks({ status: "pending" });
+      for (const task of pending) {
+        this.eventBus.emit("task_created", task);
+      }
+    }, 5000);
 
     // ---- Event handlers ----
 
@@ -96,6 +111,10 @@ export class TaskWatcher {
    * Stop watching.
    */
   async stop(): Promise<void> {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
     if (this.watcher) {
       await this.watcher.close();
       this.watcher = null;
