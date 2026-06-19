@@ -72,21 +72,27 @@ taskCmd
   .command("add")
   .description("Create a new task")
   .requiredOption("--description <text>", "Task description")
-  .requiredOption("--files <paths...>", "Target file paths")
+  .option("--files <paths...>", "Target file paths (optional — agent will discover if not specified)")
   .option("--dependency <task-id>", "Task ID this task depends on")
   .action((options) => {
     const root = resolveRepoRoot();
     const store = new TaskStore(root);
 
+    const targetFiles: string[] = options.files ?? [];
+
     const task = store.createTask({
       description: options.description,
-      target_files: options.files,
+      target_files: targetFiles,
       dependency: options.dependency ?? null,
     });
 
     console.log(chalk.green(`Task created: ${task.id}`));
     console.log(`  Status: ${chalk.yellow(task.status)}`);
-    console.log(`  Files: ${task.target_files.join(", ")}`);
+    if (task.target_files.length > 0) {
+      console.log(`  Files: ${task.target_files.join(", ")}`);
+    } else {
+      console.log(`  Files: ${chalk.dim("(auto-discover)")}`);
+    }
   });
 
 taskCmd

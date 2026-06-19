@@ -9,6 +9,7 @@ import { EventEmitter } from "node:events";
  *   {"type":"heartbeat","agent_id":"agent-001","locks":["src/auth.ts"]}
  *   {"type":"task_done","agent_id":"agent-001","task_id":"uuid"}
  *   {"type":"task_failed","agent_id":"agent-001","task_id":"uuid","reason":"..."}
+ *   {"type":"lock_request","agent_id":"agent-001","task_id":"uuid","files":["src/x.ts"]}
  *
  * Server → Agent:
  *   {"type":"ping"}
@@ -16,6 +17,8 @@ import { EventEmitter } from "node:events";
  *   {"type":"merge_completed","task_id":"uuid"}
  *   {"type":"warning","task_id":"uuid","message":"..."}
  *   {"type":"lease_expired","file":"src/auth.ts"}
+ *   {"type":"lock_granted","task_id":"uuid","files":["src/x.ts"]}
+ *   {"type":"lock_denied","task_id":"uuid","files":["src/x.ts"],"reason":"File locked by agent-002"}
  */
 
 export interface SocketMessage {
@@ -130,6 +133,29 @@ export class SocketServer extends EventEmitter {
     for (const agentId of this.agents.keys()) {
       this.sendToAgent(agentId, message);
     }
+  }
+
+  /**
+   * Send a lock_granted message to an agent.
+   */
+  sendLockGranted(agentId: string, taskId: string, files: string[]): boolean {
+    return this.sendToAgent(agentId, {
+      type: "lock_granted",
+      task_id: taskId,
+      files,
+    });
+  }
+
+  /**
+   * Send a lock_denied message to an agent.
+   */
+  sendLockDenied(agentId: string, taskId: string, files: string[], reason: string): boolean {
+    return this.sendToAgent(agentId, {
+      type: "lock_denied",
+      task_id: taskId,
+      files,
+      reason,
+    });
   }
 
   /**
@@ -252,6 +278,15 @@ export class SocketServer extends EventEmitter {
         const reason = msg.reason as string ?? "unknown";
         if (!agentId || !taskId) return;
         this.emit("task_failed", agentId, taskId, reason);
+        break;
+      }
+
+      case "lock_request": {
+        const agentId = msg.agent_id as string;
+        const taskId = msg.task_id as string;
+        const files = msg.files as string[] ?? [];
+        if (!agentId || !taskId || files.length === 0) return;
+        this.emit("lock_request", agentId, taskId, files);
         break;
       }
 

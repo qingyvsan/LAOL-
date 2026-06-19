@@ -18,7 +18,7 @@ export interface Task {
   id: string; // uuid v4
   status: TaskStatus;
   description: string;
-  target_files: string[]; // relative paths from repo root
+  target_files: string[]; // relative paths from repo root (may be empty if agent discovers files)
   assigned_agent: string | null;
   created_at: number; // Unix timestamp ms
   updated_at: number; // Unix timestamp ms

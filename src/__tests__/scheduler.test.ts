@@ -95,6 +95,17 @@ describe("Scheduler — Task Assignment Logic", () => {
     expect(result.can_assign).toBe(true);
   });
 
+  it("conflict check passes for empty target_files (discovery mode)", () => {
+    const task = taskStore.createTask({
+      description: "Explore and fix",
+      target_files: [],
+    });
+
+    const result = conflictChecker.canAssign(task);
+    expect(result.can_assign).toBe(true);
+    expect(result.risk_level).toBe("low");
+  });
+
   it("findConflict returns the first conflicting lock", () => {
     lockManager.acquire(tid(), "agent-1", ["src/auth.ts"]);
 

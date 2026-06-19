@@ -105,6 +105,17 @@ export class AgentRunner {
       console.log(`[runner] Merge completed for task ${msg.task_id}`);
     });
 
+    this.socketClient.on("lock_granted", (msg: SocketMessage) => {
+      const files = msg.files as string[] ?? [];
+      console.log(`[runner] Locks granted: ${files.join(", ")}`);
+    });
+
+    this.socketClient.on("lock_denied", (msg: SocketMessage) => {
+      const files = msg.files as string[] ?? [];
+      const reason = msg.reason as string ?? "unknown";
+      console.log(`[runner] Locks denied for ${files.join(", ")}: ${reason}`);
+    });
+
     // Connect to scheduler
     await this.socketClient.connect();
   }
@@ -162,41 +173,60 @@ export class AgentRunner {
     );
 
     try {
-      await this.agentWorker.executeTask(task, async (worktreePath, _task, contextHints) => {
-        // Print context hints
-        for (const hint of contextHints) {
-          console.log(`[context] ${hint}`);
-        }
+      await this.agentWorker.executeTask(
+        task,
+        // Main executor: spawn Claude Code for the actual work
+        async (worktreePath, _task, contextHints) => {
+          // Print context hints
+          for (const hint of contextHints) {
+            console.log(`[context] ${hint}`);
+          }
 
-        console.log(chalk.cyan(`\n=== Agent Starting Work ===`));
-        console.log(chalk.cyan(`Worktree: ${worktreePath}`));
-        console.log(chalk.cyan(`Task:     ${task.description}`));
-        console.log(chalk.cyan(`Files:    ${task.target_files.join(", ")}\n`));
+          const filesStr = _task.target_files.length > 0
+            ? _task.target_files.join(", ")
+            : "(auto-discovered)";
 
-        // Execute Claude Code in the isolated worktree
-        const result = await this.claudeExecutor.execute(
-          worktreePath,
-          task,
-          contextHints,
-          (chunk) => process.stdout.write(chalk.dim(chunk))
-        );
+          console.log(chalk.cyan(`\n=== Agent Starting Work ===`));
+          console.log(chalk.cyan(`Worktree: ${worktreePath}`));
+          console.log(chalk.cyan(`Task:     ${_task.description}`));
+          console.log(chalk.cyan(`Files:    ${filesStr}\n`));
 
-        console.log(chalk.dim(`\n[claude] Duration: ${(result.durationMs / 1000).toFixed(1)}s`));
-        console.log(chalk.dim(`[claude] Exit code: ${result.exitCode}`));
+          // Execute Claude Code in the isolated worktree
+          const result = await this.claudeExecutor.execute(
+            worktreePath,
+            _task,
+            contextHints,
+            (chunk) => process.stdout.write(chalk.dim(chunk))
+          );
 
-        if (!result.success) {
-          if (result.timedOut) {
+          console.log(chalk.dim(`\n[claude] Duration: ${(result.durationMs / 1000).toFixed(1)}s`));
+          console.log(chalk.dim(`[claude] Exit code: ${result.exitCode}`));
+
+          if (!result.success) {
+            if (result.timedOut) {
+              throw new Error(
+                `Claude Code timed out after ${this.config.claude_executor.timeout_seconds}s`
+              );
+            }
             throw new Error(
-              `Claude Code timed out after ${this.config.claude_executor.timeout_seconds}s`
+              `Claude Code exited with code ${result.exitCode}: ${result.stderr.slice(0, 500)}`
             );
           }
-          throw new Error(
-            `Claude Code exited with code ${result.exitCode}: ${result.stderr.slice(0, 500)}`
-          );
-        }
 
-        console.log(chalk.green(`[claude] Task completed successfully`));
-      });
+          console.log(chalk.green(`[claude] Task completed successfully`));
+        },
+        // Discovery executor: spawn Claude Code to discover target files
+        async (worktreePath, _task) => {
+          console.log(chalk.yellow(`[discovery] Exploring codebase to determine target files...`));
+          const discovery = await this.claudeExecutor.executeDiscovery(
+            worktreePath,
+            _task,
+            (chunk) => process.stdout.write(chalk.dim(`[discovery] ${chunk}`))
+          );
+          console.log(chalk.yellow(`[discovery] Found ${discovery.files.length} files in ${(discovery.durationMs / 1000).toFixed(1)}s`));
+          return discovery.files;
+        }
+      );
     } catch (err) {
       console.error(`[runner] Task failed: ${err}`);
     }

@@ -137,6 +137,66 @@ export class SocketClient extends EventEmitter {
   }
 
   /**
+   * Request locks for additional files during task execution.
+   */
+  requestLocks(taskId: string, files: string[]): boolean {
+    return this.send({
+      type: "lock_request",
+      agent_id: this.agentId,
+      task_id: taskId,
+      files,
+    });
+  }
+
+  /**
+   * Request locks and wait for a response (Promise-based, for sync flows).
+   * Returns the granted files array, or throws if denied.
+   */
+  async requestLocksAsync(taskId: string, files: string[]): Promise<string[]> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.off("lock_granted", onGranted);
+        this.off("lock_denied", onDenied);
+        reject(new Error(`Lock request timed out for task ${taskId.slice(0, 8)}`));
+      }, 30000);
+
+      const onGranted = (msg: SocketMessage) => {
+        if (msg.task_id === taskId) {
+          clearTimeout(timeout);
+          this.off("lock_denied", onDenied);
+          resolve((msg.files as string[]) ?? []);
+        }
+      };
+
+      const onDenied = (msg: SocketMessage) => {
+        if (msg.task_id === taskId) {
+          clearTimeout(timeout);
+          this.off("lock_granted", onGranted);
+          reject(new Error((msg.reason as string) ?? "Lock request denied"));
+        }
+      };
+
+      this.on("lock_granted", onGranted);
+      this.on("lock_denied", onDenied);
+
+      // Send the request
+      const sent = this.send({
+        type: "lock_request",
+        agent_id: this.agentId,
+        task_id: taskId,
+        files,
+      });
+
+      if (!sent) {
+        clearTimeout(timeout);
+        this.off("lock_granted", onGranted);
+        this.off("lock_denied", onDenied);
+        reject(new Error("Failed to send lock request (not connected)"));
+      }
+    });
+  }
+
+  /**
    * Disconnect from the scheduler.
    */
   disconnect(): void {

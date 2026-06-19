@@ -21,7 +21,7 @@ export const TaskSchema = z.object({
   id: z.string().uuid(),
   status: TaskStatusSchema,
   description: z.string().min(1),
-  target_files: z.array(z.string().min(1)).min(1),
+  target_files: z.array(z.string().min(1)).default([]),
   assigned_agent: z.string().nullable(),
   created_at: z.number().positive(),
   updated_at: z.number().positive(),

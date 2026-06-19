@@ -335,4 +335,96 @@ describe("E2E Smoke — full pipeline", () => {
     const shouldSkip = !depTask || depTask.status !== "done";
     expect(shouldSkip).toBe(true);
   });
+
+  // --- Discovery mode (empty target_files) ---
+
+  it("discovery mode: task with empty target_files → discovery → lock → execute → done", () => {
+    // Create task without pre-declared files
+    const task = taskStore.createTask({
+      description: "Discover which files need auth refactoring",
+      target_files: [],
+    });
+
+    expect(task.target_files).toEqual([]);
+
+    // Conflict check passes
+    const check = conflictChecker.canAssign(task);
+    expect(check.can_assign).toBe(true);
+
+    // Mark in_progress (scheduler assigns without locks)
+    const assigned = taskStore.updateTask(task.id, () => ({
+      status: "in_progress",
+      assigned_agent: "agent-1",
+    }));
+    expect(assigned).not.toBeNull();
+
+    // Agent discovers files and acquires locks
+    const discoveredFiles = ["src/auth.ts", "src/auth.test.ts", "src/utils.ts"];
+    const lockResult = lockManager.acquire(task.id, "agent-1", discoveredFiles);
+    expect(lockResult.success).toBe(true);
+
+    // Execute work (simulated)
+    expect(lockManager.isLocked("src/auth.ts")).toBe(true);
+    expect(lockManager.isLocked("src/auth.test.ts")).toBe(true);
+    expect(lockManager.isLocked("src/utils.ts")).toBe(true);
+
+    // Release and complete
+    for (const f of discoveredFiles) {
+      lockManager.release(f);
+    }
+
+    const done = taskStore.updateTask(task.id, () => ({
+      status: "done",
+      target_files: discoveredFiles,
+      updated_at: Date.now(),
+    }));
+    expect(done).not.toBeNull();
+    expect(done!.status).toBe("done");
+    expect(done!.target_files).toEqual(discoveredFiles);
+  });
+
+  it("discovery mode: two agents discover different files — no conflict", () => {
+    const taskA = taskStore.createTask({ description: "Fix A", target_files: [] });
+    const taskB = taskStore.createTask({ description: "Fix B", target_files: [] });
+
+    // Both tasks can be assigned
+    taskStore.updateTask(taskA.id, () => ({ status: "in_progress", assigned_agent: "agent-1" }));
+    taskStore.updateTask(taskB.id, () => ({ status: "in_progress", assigned_agent: "agent-2" }));
+
+    // Agent 1 discovers and locks files in module A
+    const lockA = lockManager.acquire(taskA.id, "agent-1", ["src/moduleA/x.ts"]);
+    expect(lockA.success).toBe(true);
+
+    // Agent 2 discovers and locks files in module B — no conflict
+    const lockB = lockManager.acquire(taskB.id, "agent-2", ["src/moduleB/y.ts"]);
+    expect(lockB.success).toBe(true);
+
+    // Cleanup
+    lockManager.release("src/moduleA/x.ts");
+    lockManager.release("src/moduleB/y.ts");
+  });
+
+  it("discovery mode: agent discovers file already locked by other → denied", () => {
+    const taskA = taskStore.createTask({ description: "Fix A", target_files: ["src/shared.ts"] });
+    const taskB = taskStore.createTask({ description: "Fix B", target_files: [] });
+
+    // Task A locks shared file immediately
+    lockManager.acquire(taskA.id, "agent-1", ["src/shared.ts"]);
+
+    // Task B is assigned
+    taskStore.updateTask(taskB.id, () => ({ status: "in_progress", assigned_agent: "agent-2" }));
+
+    // Agent 2 discovers shared.ts — should be denied
+    const conflictB = lockManager.acquire(taskB.id, "agent-2", ["src/shared.ts"]);
+    expect(conflictB.success).toBe(false);
+    expect(conflictB.reason).toContain("already locked");
+
+    // But can lock non-conflicting files
+    const okB = lockManager.acquire(taskB.id, "agent-2", ["src/other.ts"]);
+    expect(okB.success).toBe(true);
+
+    // Cleanup
+    lockManager.release("src/shared.ts");
+    lockManager.release("src/other.ts");
+  });
 });

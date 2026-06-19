@@ -46,6 +46,69 @@ export class ClaudeCodeExecutor {
   }
 
   /**
+   * Execute Claude Code in discovery mode: read-only exploration to determine
+   * which files need to be modified. Returns a list of file paths (parsed from
+   * Claude's JSON output).
+   *
+   * @param worktreePath - Absolute path to the isolated git worktree
+   * @param task - The task to discover files for
+   * @param onOutput - Optional callback for real-time stdout streaming
+   */
+  async executeDiscovery(
+    worktreePath: string,
+    task: Task,
+    onOutput?: (chunk: string) => void
+  ): Promise<{ files: string[]; durationMs: number }> {
+    const startTime = Date.now();
+    const discoveryPrompt = this.buildDiscoveryPrompt(worktreePath, task);
+
+    const child = spawn(this.binaryPath, [
+      "-p", discoveryPrompt,
+      "--output-format", "text",
+      "--allowedTools", "Read, Glob, Grep",
+      "--effort", "low",
+      "--dangerously-skip-permissions",
+    ], {
+      cwd: worktreePath,
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: process.platform === "win32",
+    });
+
+    return new Promise((resolve) => {
+      let stdout = "";
+      const timer = setTimeout(() => {
+        child.kill("SIGTERM");
+        resolve({ files: [], durationMs: Date.now() - startTime });
+      }, 60000); // 60s timeout for discovery
+
+      child.stdout?.on("data", (data: Buffer) => {
+        const chunk = data.toString();
+        stdout += chunk;
+        onOutput?.(chunk);
+      });
+
+      child.on("close", (code: number | null) => {
+        clearTimeout(timer);
+        const durationMs = Date.now() - startTime;
+
+        if (code !== 0) {
+          resolve({ files: [], durationMs });
+          return;
+        }
+
+        // Parse JSON file list from Claude's output
+        const files = this.parseFileList(stdout);
+        resolve({ files, durationMs });
+      });
+
+      child.on("error", () => {
+        clearTimeout(timer);
+        resolve({ files: [], durationMs: Date.now() - startTime });
+      });
+    });
+  }
+
+  /**
    * Execute Claude Code in the given worktree to perform the task.
    *
    * @param worktreePath - Absolute path to the isolated git worktree
@@ -164,6 +227,54 @@ export class ClaudeCodeExecutor {
     });
   }
 
+  // ---- Discovery prompt ----
+
+  private buildDiscoveryPrompt(worktreePath: string, task: Task): string {
+    const lines: string[] = [];
+
+    lines.push("You are a code exploration assistant. Your ONLY job is to determine");
+    lines.push("which files need to be modified to complete the task below.");
+    lines.push("");
+    lines.push("## Task");
+    lines.push(task.description);
+    lines.push("");
+    lines.push("## Instructions");
+    lines.push("1. Use Read and Glob tools to explore the codebase structure");
+    lines.push("2. Identify ALL files that would need to be modified to complete the task");
+    lines.push("3. Output ONLY a JSON array of relative file paths, nothing else");
+    lines.push("");
+    lines.push("Example output format:");
+    lines.push('["src/auth.ts", "src/auth.test.ts", "src/types.ts"]');
+    lines.push("");
+    lines.push("IMPORTANT: Output ONLY the JSON array. No other text, no markdown, no explanation.");
+
+    return lines.join("\n");
+  }
+
+  /**
+   * Parse a JSON file list from Claude's output, handling various formats.
+   */
+  private parseFileList(output: string): string[] {
+    // Try to extract a JSON array from the output (handles markdown code blocks etc.)
+    const arrayMatch = output.match(/\[[\s\S]*?\]/);
+    if (!arrayMatch) return [];
+
+    try {
+      const parsed = JSON.parse(arrayMatch[0]);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((item): item is string => typeof item === "string" && item.length > 0);
+      }
+    } catch {
+      // Fallback: try to extract individual lines that look like file paths
+      const lines = output.split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l.match(/^["']?[\w./-]+\.(ts|tsx|js|jsx|json|css|scss)["']?$/));
+      return lines.map((l) => l.replace(/^["']|["']$/g, ""));
+    }
+
+    return [];
+  }
+
   // ---- Prompt building ----
 
   private buildPrompt(
@@ -187,6 +298,12 @@ export class ClaudeCodeExecutor {
       for (const f of task.target_files) {
         lines.push(`- ${f}`);
       }
+      lines.push("");
+    } else {
+      lines.push("## Exploration First");
+      lines.push("No target files were pre-specified. You must first explore the");
+      lines.push("codebase to determine which files need to be modified, then proceed");
+      lines.push("with the implementation.");
       lines.push("");
     }
 

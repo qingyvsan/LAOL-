@@ -90,10 +90,13 @@ export class AgentWorker {
    * @param task - The task to execute
    * @param executor - Callback that performs the actual AI code modifications.
    *   Receives the worktree path and should return void or throw on failure.
+   * @param discoveryExecutor - Optional callback for file discovery when
+   *   target_files is empty. Returns discovered file paths.
    */
   async executeTask(
     task: Task,
-    executor: (worktreePath: string, task: Task, contextHints: string[]) => Promise<void>
+    executor: (worktreePath: string, task: Task, contextHints: string[]) => Promise<void>,
+    discoveryExecutor?: (worktreePath: string, task: Task) => Promise<string[]>
   ): Promise<void> {
     this.currentTask = task;
     const taskId = task.id;
@@ -104,19 +107,11 @@ export class AgentWorker {
         throw new Error(`Task ${taskId} is not in_progress (current: ${task.status})`);
       }
 
-      // 2. Start heartbeat
-      this.activeLockFiles = task.target_files.map((f) => f); // copy
-      this.heartbeat.start(() => this.activeLockFiles);
-
-      // 3. Start perception
-      this.perception = new Perception(this.repoRoot, taskId, task.target_files);
-      this.perception.start();
-
-      // 4. Acquire worktree
+      // 2. Acquire worktree
       console.log(`[agent ${this.agentId}] Acquiring worktree for task ${taskId.slice(0, 8)}...`);
       const handle = this.worktreePool.acquire(taskId);
 
-      // 5. Setup checkpoint
+      // 3. Setup checkpoint
       this.checkpoint = new Checkpoint(
         handle.path,
         taskId,
@@ -124,7 +119,37 @@ export class AgentWorker {
         this.config.agent.checkpoint_min_interval_ms
       );
 
-      // 6. Collect context hints
+      // 4. Discovery phase — if target_files is empty, discover files first
+      if (task.target_files.length === 0 && discoveryExecutor) {
+        console.log(`[agent ${this.agentId}] Entering discovery phase for task ${taskId.slice(0, 8)}...`);
+        const discoveredFiles = await discoveryExecutor(handle.path, task);
+
+        if (discoveredFiles.length === 0) {
+          throw new Error("Discovery failed: no files identified for the task");
+        }
+
+        console.log(`[agent ${this.agentId}] Discovered ${discoveredFiles.length} files: ${discoveredFiles.join(", ")}`);
+
+        // Request locks for discovered files
+        const grantedFiles = await this.socketClient.requestLocksAsync(taskId, discoveredFiles);
+        console.log(`[agent ${this.agentId}] Locks granted for: ${grantedFiles.join(", ")}`);
+
+        this.activeLockFiles = grantedFiles;
+        // Update task with discovered files
+        task = { ...task, target_files: grantedFiles };
+      } else {
+        this.activeLockFiles = task.target_files.map((f) => f); // copy
+      }
+
+      // 5. Start heartbeat (now that we have locks)
+      this.heartbeat.start(() => this.activeLockFiles);
+
+      // 6. Start perception
+      this.perception = new Perception(this.repoRoot, taskId,
+        this.activeLockFiles.length > 0 ? this.activeLockFiles : task.target_files);
+      this.perception.start();
+
+      // 7. Collect context hints
       const contextHints: string[] = [];
 
       // Check warnings
@@ -139,7 +164,7 @@ export class AgentWorker {
         contextHints.push(ctxSummary);
       }
 
-      // 7. Pre-work checkpoint
+      // 8. Pre-work checkpoint
       try {
         const result = this.checkpoint.checkAndRebase();
         if (result.updated && result.message) {
@@ -153,18 +178,18 @@ export class AgentWorker {
         throw err;
       }
 
-      // 8. Execute the actual AI work
+      // 9. Execute the actual AI work
       console.log(`[agent ${this.agentId}] Starting work on task ${taskId.slice(0, 8)}`);
       await executor(handle.path, task, contextHints);
 
-      // 9. Commit changes
+      // 10. Commit changes
       this.commitChanges(handle.path, task);
 
-      // 10. Push branch
+      // 11. Push branch
       this.pushBranch(handle.path, task);
 
-      // 11. Update registry for modified files
-      for (const file of task.target_files) {
+      // 12. Update registry for modified files
+      for (const file of this.activeLockFiles) {
         this.registryManager.updateEntry(
           file,
           this.agentId,
@@ -172,7 +197,7 @@ export class AgentWorker {
         );
       }
 
-      // 12. Complete task
+      // 13. Complete task
       this.completeTask(taskId);
 
     } catch (err) {
@@ -183,6 +208,28 @@ export class AgentWorker {
       // Cleanup regardless of outcome
       this.cleanup(taskId);
     }
+  }
+
+  /**
+   * Expand the set of locked files during execution (dynamic lock expansion).
+   * Called when the agent discovers it needs additional files mid-task.
+   */
+  async expandLocks(files: string[]): Promise<string[]> {
+    if (!this.currentTask) {
+      throw new Error("No active task");
+    }
+
+    // Filter out already-held files
+    const newFiles = files.filter((f) => !this.activeLockFiles.includes(f));
+    if (newFiles.length === 0) return [];
+
+    const grantedFiles = await this.socketClient.requestLocksAsync(
+      this.currentTask.id,
+      newFiles
+    );
+
+    this.activeLockFiles.push(...grantedFiles);
+    return grantedFiles;
   }
 
   // ---- Lifecycle ----

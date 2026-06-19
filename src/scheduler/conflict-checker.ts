@@ -47,6 +47,12 @@ export class ConflictChecker {
       // If the dependency is declared, the scheduler must verify it.
     }
 
+    // If target_files is empty, skip conflict detection — the agent will
+    // discover and request locks dynamically during execution.
+    if (task.target_files.length === 0) {
+      return { can_assign: true, risk_level: "low" };
+    }
+
     // --- Check 2: Direct lock conflicts ---
     const directConflict = this.checkDirectConflicts(task.target_files);
     if (directConflict) {

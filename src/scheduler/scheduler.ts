@@ -44,11 +44,14 @@ export class Scheduler {
   private socketServer: SocketServer;
   private walManager: WalManager;
 
-  // Agent tracking: agentId → { currentTask, connectedAt }
+  // Agent tracking: agentId → { currentTask, connectedAt, heldLocks }
   private agents = new Map<string, AgentInfo>();
 
   // File-waiting mapping: file → set of task IDs waiting for it
   private waitingTasks = new Map<string, Set<string>>();
+
+  // Per-agent lock tracking: agentId → Set<file> (dynamic, grows during execution)
+  private agentLocks = new Map<string, Set<string>>();
 
   constructor(repoRoot: string) {
     this.repoRoot = repoRoot;
@@ -129,6 +132,10 @@ export class Scheduler {
 
     this.socketServer.on("task_failed", (agentId: string, taskId: string, reason: string) => {
       this.handleTaskFailed(agentId, taskId, reason);
+    });
+
+    this.socketServer.on("lock_request", (agentId: string, taskId: string, files: string[]) => {
+      this.handleLockRequest(agentId, taskId, files);
     });
 
     // 4. Wire up internal event bus
@@ -237,14 +244,23 @@ export class Scheduler {
       return;
     }
 
-    // 4. Acquire locks (atomic two-phase commit)
-    const acquireResult = this.lockManager.acquire(task.id, idleAgent, task.target_files);
-    if (!acquireResult.success) {
-      // Lock conflict — track waiting and leave pending
-      for (const file of task.target_files) {
-        this.addWaitingTask(file, task.id);
+    // 4. Acquire locks (atomic two-phase commit) — skip if no target files
+    let locks: string[] = [];
+    if (task.target_files.length > 0) {
+      const acquireResult = this.lockManager.acquire(task.id, idleAgent, task.target_files);
+      if (!acquireResult.success) {
+        // Lock conflict — track waiting and leave pending
+        for (const file of task.target_files) {
+          this.addWaitingTask(file, task.id);
+        }
+        return;
       }
-      return;
+      locks = acquireResult.locks?.map((l) => l.file) ?? [];
+      // Track locks per agent
+      this.agentLocks.set(idleAgent, new Set(locks));
+    } else {
+      // No files to lock — agent will discover and request locks dynamically
+      this.agentLocks.set(idleAgent, new Set());
     }
 
     // 5. Update task state
@@ -260,9 +276,10 @@ export class Scheduler {
 
     if (!updated) {
       // Version conflict — rollback locks
-      for (const lock of acquireResult.locks ?? []) {
-        this.lockManager.release(lock.file);
+      for (const file of locks) {
+        this.lockManager.release(file);
       }
+      this.agentLocks.delete(idleAgent);
       return;
     }
 
@@ -281,7 +298,7 @@ export class Scheduler {
       task_id: task.id,
       description: task.description,
       target_files: task.target_files,
-      locks: acquireResult.locks?.map((l) => l.file) ?? [],
+      locks,
     });
 
     // 9. Write warning file if semantic warnings exist
@@ -398,15 +415,20 @@ export class Scheduler {
     const task = this.taskStore.getTask(taskId);
     if (!task) return;
 
-    // Release all locks
-    for (const file of task.target_files) {
-      this.lockManager.release(file);
-      this.eventBus.emit("lock_released", file);
+    // Release all locks (from agent's tracked set, since files may be dynamic)
+    const heldLocks = this.agentLocks.get(agentId);
+    if (heldLocks) {
+      for (const file of heldLocks) {
+        this.lockManager.release(file);
+        this.eventBus.emit("lock_released", file);
+      }
+      this.agentLocks.delete(agentId);
     }
 
-    // Update task
+    // Update task with the full file set discovered during execution
     this.taskStore.updateTask(taskId, () => ({
       status: "done",
+      target_files: heldLocks ? [...heldLocks] : task.target_files,
       updated_at: Date.now(),
     }));
 
@@ -430,10 +452,14 @@ export class Scheduler {
     const task = this.taskStore.getTask(taskId);
     if (!task) return;
 
-    // Release all locks
-    for (const file of task.target_files) {
-      this.lockManager.release(file);
-      this.eventBus.emit("lock_released", file);
+    // Release all locks (from agent's tracked set)
+    const heldLocks = this.agentLocks.get(agentId);
+    if (heldLocks) {
+      for (const file of heldLocks) {
+        this.lockManager.release(file);
+        this.eventBus.emit("lock_released", file);
+      }
+      this.agentLocks.delete(agentId);
     }
 
     // Circuit breaker: failure
@@ -447,6 +473,7 @@ export class Scheduler {
 
     this.taskStore.updateTask(taskId, () => ({
       status: newStatus,
+      target_files: heldLocks ? [...heldLocks] : task.target_files,
       metadata: { failure_reason: reason, retry_count: (task.metadata?.retry_count as number ?? 0) + 1 },
     }));
 
@@ -473,6 +500,52 @@ export class Scheduler {
     // Merge will be handled by the merge driver (Phase 7)
     // For now, just emit the event
     this.eventBus.emit("merge_required", task.id, `agent/${task.id}`);
+  }
+
+  /**
+   * Handle a lock_request from an agent: run conflict check + acquire locks
+   * for the requested files, then respond with lock_granted or lock_denied.
+   */
+  private handleLockRequest(agentId: string, taskId: string, files: string[]): void {
+    // Deduplicate and check which files the agent already has locked
+    const currentLocks = this.agentLocks.get(agentId) ?? new Set();
+    const newFiles = files.filter((f) => !currentLocks.has(f));
+
+    if (newFiles.length === 0) {
+      // All files already locked — grant immediately
+      this.socketServer.sendLockGranted(agentId, taskId, files);
+      return;
+    }
+
+    // Check conflicts for the new files
+    const directConflict = this.lockManager.findConflict(newFiles);
+    if (directConflict) {
+      this.socketServer.sendLockDenied(
+        agentId,
+        taskId,
+        [directConflict.file],
+        `File "${directConflict.file}" is locked by agent "${directConflict.holder}"`
+      );
+      return;
+    }
+
+    // Acquire locks atomically
+    const acquireResult = this.lockManager.acquire(taskId, agentId, newFiles);
+    if (!acquireResult.success) {
+      this.socketServer.sendLockDenied(agentId, taskId, newFiles, acquireResult.reason ?? "Lock acquisition failed");
+      return;
+    }
+
+    // Track new locks
+    const acquiredFiles = acquireResult.locks?.map((l) => l.file) ?? [];
+    for (const file of acquiredFiles) {
+      currentLocks.add(file);
+    }
+    this.agentLocks.set(agentId, currentLocks);
+
+    // Grant the locks
+    this.socketServer.sendLockGranted(agentId, taskId, files);
+    console.log(`[scheduler] Lock request granted for agent ${agentId}: ${files.join(", ")}`);
   }
 
   // ---- Helpers ----
