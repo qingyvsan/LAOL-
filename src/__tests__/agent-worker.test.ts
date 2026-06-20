@@ -131,6 +131,12 @@ function makeMocks() {
       }),
       release: vi.fn(),
     },
+    knowledgeStore: {
+      save: vi.fn(),
+      findRelevant: vi.fn().mockReturnValue([]),
+      formatContext: vi.fn().mockReturnValue(null),
+      loadAll: vi.fn().mockReturnValue([]),
+    },
     socketClient: {
       notifyTaskDone: vi.fn(),
       notifyTaskFailed: vi.fn(),
@@ -174,7 +180,8 @@ describe("AgentWorker — lifecycle", () => {
       mocks.leaseManager as any,
       mocks.worktreePool as any,
       mocks.socketClient as any,
-      mocks.registryManager as any
+      mocks.registryManager as any,
+      mocks.knowledgeStore as any
     );
   });
 

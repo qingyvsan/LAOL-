@@ -30,4 +30,6 @@ export { SocketServer } from "./events/socket-server";
 export { SocketClient } from "./events/socket-client";
 export { WalManager } from "./wal/wal-manager";
 export { RegistryManager } from "./registry/registry-manager";
+export { KnowledgeStore } from "./knowledge/knowledge-store";
+export type { KnowledgeEntry } from "./knowledge/knowledge-store";
 export { loadConfig, saveConfig, resolveRepoRoot, DEFAULT_CONFIG } from "./config";

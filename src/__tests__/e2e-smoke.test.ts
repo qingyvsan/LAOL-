@@ -109,6 +109,15 @@ describe("E2E Smoke — full pipeline", () => {
     };
   }
 
+  function makeMockKnowledgeStore() {
+    return {
+      save: vi.fn(),
+      findRelevant: vi.fn().mockReturnValue([]),
+      formatContext: vi.fn().mockReturnValue(null),
+      loadAll: vi.fn().mockReturnValue([]),
+    };
+  }
+
   function makeMockRegistry() {
     return { updateEntry: vi.fn() };
   }
@@ -149,7 +158,8 @@ describe("E2E Smoke — full pipeline", () => {
     const worker = new AgentWorker(
       repoDir, "agent-1",
       taskStore, lockManager, leaseManager,
-      worktreePool as any, socketClient as any, registry as any
+      worktreePool as any, socketClient as any, registry as any,
+      makeMockKnowledgeStore() as any
     );
 
     // Executor: modify the file (simulating AI work)
@@ -249,7 +259,8 @@ describe("E2E Smoke — full pipeline", () => {
       taskStore, lockManager, leaseManager,
       makeMockWorktreePool() as any,
       makeMockSocketClient() as any,
-      makeMockRegistry() as any
+      makeMockRegistry() as any,
+      makeMockKnowledgeStore() as any
     );
 
     const updated = taskStore.getTask(task.id);
@@ -273,7 +284,8 @@ describe("E2E Smoke — full pipeline", () => {
     const worker = new AgentWorker(
       repoDir, "agent-1",
       taskStore, lockManager, leaseManager,
-      makeMockWorktreePool() as any, socketClient as any, makeMockRegistry() as any
+      makeMockWorktreePool() as any, socketClient as any, makeMockRegistry() as any,
+      makeMockKnowledgeStore() as any
     );
 
     // Executor throws

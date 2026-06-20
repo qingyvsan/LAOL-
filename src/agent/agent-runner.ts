@@ -6,6 +6,7 @@ import { LockManager } from "../lock/lock-manager";
 import { LeaseManager } from "../lock/lease-manager";
 import { WorktreePool } from "../worktree/pool";
 import { RegistryManager } from "../registry/registry-manager";
+import { KnowledgeStore } from "../knowledge/knowledge-store";
 import { loadConfig } from "../config";
 import chalk from "chalk";
 import type { Task, LaolConfig } from "../data/models";
@@ -36,6 +37,7 @@ export class AgentRunner {
   private leaseManager: LeaseManager;
   private worktreePool: WorktreePool;
   private registryManager: RegistryManager;
+  private knowledgeStore: KnowledgeStore;
   private claudeExecutor: ClaudeCodeExecutor;
 
   private running = false;
@@ -55,6 +57,7 @@ export class AgentRunner {
     this.leaseManager = new LeaseManager(this.lockManager);
     this.worktreePool = new WorktreePool(repoRoot, this.config.scheduler.pool_size);
     this.registryManager = new RegistryManager(repoRoot);
+    this.knowledgeStore = new KnowledgeStore(repoRoot);
     this.claudeExecutor = new ClaudeCodeExecutor(this.config.claude_executor);
     this.socketClient = new SocketClient(agentId, port, host);
   }
@@ -195,6 +198,17 @@ export class AgentRunner {
     console.log(`  Files:       ${task.target_files.join(", ")}`);
     console.log(`${"=".repeat(60)}\n`);
 
+    // Query shared knowledge for context hints
+    const knowledgeHints = this.knowledgeStore.findRelevant(
+      task.target_files,
+      task.description,
+      3
+    );
+    const knowledgeContext = this.knowledgeStore.formatContext(knowledgeHints);
+
+    // Capture discovery output for knowledge sharing
+    let discoveryOutput = "";
+
     // Create agent worker for this task
     this.agentWorker = new AgentWorker(
       this.repoRoot,
@@ -204,7 +218,8 @@ export class AgentRunner {
       this.leaseManager,
       this.worktreePool,
       this.socketClient,
-      this.registryManager
+      this.registryManager,
+      this.knowledgeStore
     );
 
     try {
@@ -213,6 +228,10 @@ export class AgentRunner {
         // Main executor: spawn Claude Code for the actual work
         async (worktreePath, _task, contextHints) => {
           // Print context hints
+          if (knowledgeContext) {
+            console.log(chalk.magenta(`[knowledge] ${knowledgeContext}`));
+            contextHints.unshift(knowledgeContext);
+          }
           for (const hint of contextHints) {
             console.log(`[context] ${hint}`);
           }
@@ -237,6 +256,16 @@ export class AgentRunner {
           console.log(chalk.dim(`\n[claude] Duration: ${(result.durationMs / 1000).toFixed(1)}s`));
           console.log(chalk.dim(`[claude] Exit code: ${result.exitCode}`));
 
+          // Save knowledge for future agents
+          this.knowledgeStore.save({
+            task_id: _task.id,
+            agent_id: this.agentId,
+            description: _task.description,
+            summary: result.stdout.slice(0, 500) || _task.description,
+            files: _task.target_files,
+            created_at: Date.now(),
+          });
+
           if (!result.success) {
             if (result.timedOut) {
               throw new Error(
@@ -259,9 +288,26 @@ export class AgentRunner {
             (chunk) => process.stdout.write(chalk.dim(`[discovery] ${chunk}`))
           );
           console.log(chalk.yellow(`[discovery] Found ${discovery.files.length} files in ${(discovery.durationMs / 1000).toFixed(1)}s`));
+          discoveryOutput = discovery.output;
           return discovery.files;
         }
       );
+
+      // If it was a read-only task (no target files after execution),
+      // save the discovery output as shared knowledge.
+      if (discoveryOutput) {
+        const updatedTask = this.taskStore.getTask(taskId);
+        if (updatedTask && (updatedTask.target_files.length === 0 || updatedTask.metadata?.read_only)) {
+          this.knowledgeStore.save({
+            task_id: task.id,
+            agent_id: this.agentId,
+            description: task.description,
+            summary: discoveryOutput.slice(0, 500),
+            files: [],
+            created_at: Date.now(),
+          });
+        }
+      }
     } catch (err) {
       console.error(`[runner] Task failed: ${err}`);
     }

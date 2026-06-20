@@ -9,6 +9,7 @@ import { Checkpoint, RebaseConflictError } from "./checkpoint";
 import { Perception } from "./perception";
 import { SocketClient } from "../events/socket-client";
 import { RegistryManager } from "../registry/registry-manager";
+import { KnowledgeStore } from "../knowledge/knowledge-store";
 import { loadConfig } from "../config";
 import type { Task, LaolConfig } from "../data/models";
 
@@ -46,6 +47,7 @@ export class AgentWorker {
   private worktreePool: WorktreePool;
   private socketClient: SocketClient;
   private registryManager: RegistryManager;
+  private knowledgeStore: KnowledgeStore;
 
   // Per-task state
   private currentTask: Task | null = null;
@@ -64,7 +66,8 @@ export class AgentWorker {
     leaseManager: LeaseManager,
     worktreePool: WorktreePool,
     socketClient: SocketClient,
-    registryManager: RegistryManager
+    registryManager: RegistryManager,
+    knowledgeStore: KnowledgeStore
   ) {
     this.repoRoot = repoRoot;
     this.agentId = agentId;
@@ -76,6 +79,7 @@ export class AgentWorker {
     this.worktreePool = worktreePool;
     this.socketClient = socketClient;
     this.registryManager = registryManager;
+    this.knowledgeStore = knowledgeStore;
 
     this.heartbeat = new Heartbeat(lockManager, leaseManager, agentId);
   }

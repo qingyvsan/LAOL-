@@ -164,7 +164,7 @@ export class ClaudeCodeExecutor {
     worktreePath: string,
     task: Task,
     onOutput?: (chunk: string) => void
-  ): Promise<{ files: string[]; durationMs: number }> {
+  ): Promise<{ files: string[]; output: string; durationMs: number }> {
     const startTime = Date.now();
     const discoveryPrompt = this.buildDiscoveryPrompt(worktreePath, task);
 
@@ -186,7 +186,7 @@ export class ClaudeCodeExecutor {
       let stdout = "";
       const timer = setTimeout(() => {
         killProcessTree(child.pid);
-        resolve({ files: [], durationMs: Date.now() - startTime });
+        resolve({ files: [], output: stdout, durationMs: Date.now() - startTime });
       }, 60000); // 60s timeout for discovery
 
       child.stdout?.on("data", (data: Buffer) => {
@@ -200,18 +200,18 @@ export class ClaudeCodeExecutor {
         const durationMs = Date.now() - startTime;
 
         if (code !== 0) {
-          resolve({ files: [], durationMs });
+          resolve({ files: [], output: stdout, durationMs });
           return;
         }
 
         // Parse JSON file list from Claude's output
         const files = this.parseFileList(stdout);
-        resolve({ files, durationMs });
+        resolve({ files, output: stdout, durationMs });
       });
 
       child.on("error", () => {
         clearTimeout(timer);
-        resolve({ files: [], durationMs: Date.now() - startTime });
+        resolve({ files: [], output: stdout, durationMs: Date.now() - startTime });
       });
     });
   }

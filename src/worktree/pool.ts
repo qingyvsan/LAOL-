@@ -40,6 +40,18 @@ export class WorktreePool {
   initialize(): void {
     if (this.initialized) return;
 
+    // Prune stale git worktree metadata first — if a previous shutdown
+    // removed directories without pruning, or if the process crashed,
+    // git still has the paths registered and will reject `git worktree add`
+    // with "missing but already registered worktree".
+    try {
+      execSync("git worktree prune", {
+        cwd: this.repoRoot,
+        stdio: "pipe",
+        timeout: 5000,
+      });
+    } catch { /* best effort */ }
+
     // Ensure pool directory exists
     if (!fs.existsSync(this.poolDir)) {
       fs.mkdirSync(this.poolDir, { recursive: true });
@@ -172,7 +184,7 @@ export class WorktreePool {
   }
 
   /**
-   * Shutdown the pool — clean and remove all worktrees.
+   * Shutdown the pool — clean and remove all worktrees, then prune git metadata.
    */
   shutdown(): void {
     // Clean all worktrees
@@ -189,6 +201,16 @@ export class WorktreePool {
         fs.rmSync(wtPath, { recursive: true, force: true });
       } catch { /* best effort */ }
     }
+
+    // Prune git's worktree registry so removed directories don't cause
+    // "missing but already registered" errors on next initialize().
+    try {
+      execSync("git worktree prune", {
+        cwd: this.repoRoot,
+        stdio: "pipe",
+        timeout: 5000,
+      });
+    } catch { /* best effort */ }
 
     this.available = [];
     this.inUse.clear();

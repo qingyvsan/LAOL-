@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
+import { execSync } from "node:child_process";
 import { EventBus } from "../events/event-bus";
 import { TaskStore } from "../task/task-store";
 import { TaskWatcher } from "../task/task-watcher";
@@ -576,7 +577,7 @@ export class Scheduler {
   }
 
   /**
-   * Remove all worktree directories from disk.
+   * Remove all worktree directories from disk and prune git metadata.
    */
   private cleanupWorktrees(): void {
     const worktreesDir = path.join(this.repoRoot, ".multiagent", "worktrees");
@@ -587,6 +588,18 @@ export class Scheduler {
       } catch {
         console.log("[scheduler] Warning: could not fully clean worktree directories.");
       }
+    }
+
+    // Prune git's internal worktree registry so removed directories
+    // don't cause "missing but already registered" errors on restart.
+    try {
+      execSync("git worktree prune", {
+        cwd: this.repoRoot,
+        stdio: "pipe",
+        timeout: 5000,
+      });
+    } catch {
+      // best effort
     }
   }
 
