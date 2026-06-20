@@ -37,5 +37,36 @@
     "stable_ttl_ms": 180000,
     "stable_threshold": 2,
     "probe_timeout_ms": 45000
+  },
+  "claude_executor": {
+    "binary_path": "claude",
+    "timeout_seconds": 300,
+    "max_budget_usd": 5,
+    "allowed_tools": [
+      "Read",
+      "Write",
+      "Edit",
+      "Bash",
+      "Glob",
+      "Grep"
+    ],
+    "effort": "high",
+    "skip_permissions": true
+  },
+  "codebase_indexer": {
+    "include": ["src/**/*.ts", "src/**/*.tsx"],
+    "exclude": [
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/build/**",
+      "**/.multiagent/**",
+      "**/__tests__/**",
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "**/*.spec.ts",
+      "**/*.spec.tsx"
+    ],
+    "auto_index": true,
+    "index_interval_ms": 60000
   }
 }

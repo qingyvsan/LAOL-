@@ -3,3 +3,5 @@ wal/
 staging/
 tasks/
 locks/
+codebase-index.json
+reports/

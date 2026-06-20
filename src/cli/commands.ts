@@ -10,6 +10,7 @@ import { Scheduler } from "../scheduler/scheduler";
 import { AgentRunner } from "../agent/agent-runner";
 import { loadConfig, saveConfig, resolveRepoRoot, DEFAULT_CONFIG } from "../config";
 import { formatTaskTable, formatLockTable, formatAgentTable, formatStatusOverview } from "./formatters";
+import { CodebaseIndexer } from "../codebase/indexer";
 
 const program = new Command();
 
@@ -728,6 +729,159 @@ mergeCmd
     }
 
     writeStatusFile(root, status);
+  });
+
+// ---- laol indexer ----
+
+const indexerCmd = program
+  .command("indexer")
+  .description("Codebase symbol index for LLM-assisted task localization");
+
+indexerCmd
+  .command("build")
+  .description("Build or rebuild the codebase index")
+  .option("--full", "Force full rebuild (ignore cached hashes)")
+  .action((options) => {
+    const root = resolveRepoRoot();
+    const indexer = new CodebaseIndexer(root);
+    console.log(chalk.dim("Indexing codebase..."));
+    const stats = indexer.build(options.full ?? false);
+    console.log(chalk.green(`Index built: ${stats.totalFiles} files, ${stats.totalSymbols} symbols`));
+    if (Object.keys(stats.symbolsByKind).length > 0) {
+      for (const [kind, count] of Object.entries(stats.symbolsByKind).sort()) {
+        console.log(chalk.dim(`  ${kind}: ${count}`));
+      }
+    }
+    if (stats.lastBuilt) {
+      console.log(chalk.dim(`  built at: ${new Date(stats.lastBuilt).toISOString()}`));
+    }
+  });
+
+indexerCmd
+  .command("query")
+  .description("Search the codebase index for symbols")
+  .argument("<keyword>", "Keyword to search for")
+  .action((keyword: string) => {
+    const root = resolveRepoRoot();
+    const indexer = new CodebaseIndexer(root);
+    const results = indexer.query(keyword);
+    if (results.length === 0) {
+      console.log(chalk.yellow(`No results for "${keyword}". Run "laol indexer build" first.`));
+      return;
+    }
+    console.log(chalk.bold(`\nResults for "${keyword}" (${results.length}):`));
+    for (const r of results.slice(0, 20)) {
+      const line =
+        `  [${chalk.yellow(r.symbol.kind)}] ${chalk.cyan(r.symbol.name)} ` +
+        `in ${chalk.dim(r.file)}:${r.symbol.range[0]} ` +
+        `(${chalk.green(Math.round(r.relevance) + "%")})`;
+      console.log(line);
+      if (r.symbol.jsDoc?.description) {
+        console.log(chalk.dim(`    ${r.symbol.jsDoc.description.slice(0, 120)}`));
+      }
+      if (r.symbol.parameters && r.symbol.parameters.length > 0) {
+        const params = r.symbol.parameters
+          .map((p) => `${p.name}${p.optional ? "?" : ""}: ${p.type}`)
+          .join(", ");
+        console.log(chalk.dim(`    (${params}) => ${r.symbol.returnType ?? "unknown"}`));
+      }
+    }
+  });
+
+indexerCmd
+  .command("show")
+  .description("Show indexed symbols in a file")
+  .argument("<file>", "Relative file path (e.g. src/agent/agent-worker.ts)")
+  .action((file: string) => {
+    const root = resolveRepoRoot();
+    const indexer = new CodebaseIndexer(root);
+    const entry = indexer.getFileSymbols(file);
+    if (!entry) {
+      console.log(chalk.yellow(`File "${file}" not found in index. Run "laol indexer build" first.`));
+      return;
+    }
+    console.log(chalk.bold(`\n${file} — ${entry.symbols.length} symbols, ${entry.imports.length} imports`));
+    console.log(chalk.dim(`  Indexed: ${new Date(entry.indexed_at).toISOString()}`));
+
+    if (entry.imports.length > 0) {
+      console.log(chalk.bold("\n  Imports:"));
+      for (const imp of entry.imports) {
+        const parts: string[] = [];
+        if (imp.defaultImport) parts.push(`default: ${imp.defaultImport}`);
+        if (imp.namespaceImport) parts.push(`* as ${imp.namespaceImport}`);
+        if (imp.namedImports.length > 0) parts.push(`{ ${imp.namedImports.join(", ")} }`);
+        console.log(chalk.dim(`    ${parts.join(", ")} from "${imp.moduleSpecifier}"`));
+      }
+    }
+
+    console.log(chalk.bold("\n  Symbols:"));
+    for (const sym of entry.symbols) {
+      const exp = sym.exported ? chalk.yellow(" export") : "";
+      console.log(
+        `    [${chalk.cyan(sym.kind)}${exp}] ${chalk.green(sym.name)} ` +
+        `(lines ${sym.range[0]}-${sym.range[1]})`
+      );
+      if (sym.jsDoc?.description) {
+        console.log(chalk.dim(`      ${sym.jsDoc.description.slice(0, 100)}`));
+      }
+      if (sym.parameters && sym.parameters.length > 0) {
+        const params = sym.parameters
+          .map((p) => `${p.name}${p.optional ? "?" : ""}: ${p.type}`)
+          .join(", ");
+        console.log(chalk.dim(`      (${params})`));
+      }
+      if (sym.returnType) {
+        console.log(chalk.dim(`      => ${sym.returnType}`));
+      }
+    }
+  });
+
+indexerCmd
+  .command("docs")
+  .description("Generate project API documentation in markdown format")
+  .option("--output <file>", "Write docs to a file instead of stdout")
+  .option("--files <pattern>", "Filter to matching files (glob, e.g. 'src/agent/**')")
+  .action((options) => {
+    const root = resolveRepoRoot();
+    const indexer = new CodebaseIndexer(root);
+    const filter = options.files ? [options.files] : undefined;
+    const doc = indexer.generateDocs(filter);
+
+    if (options.output) {
+      const outPath = path.resolve(root, options.output);
+      fs.mkdirSync(path.dirname(outPath), { recursive: true });
+      fs.writeFileSync(outPath, doc, "utf-8");
+      console.log(chalk.green(`Documentation written to: ${path.relative(process.cwd(), outPath)}`));
+    } else {
+      console.log(doc);
+    }
+  });
+
+indexerCmd
+  .command("stats")
+  .description("Show codebase index statistics")
+  .action(() => {
+    const root = resolveRepoRoot();
+    const indexer = new CodebaseIndexer(root);
+    const stats = indexer.getStats();
+
+    console.log(chalk.bold("\nCodebase Index Statistics"));
+    console.log(`  Files:    ${stats.totalFiles}`);
+    console.log(`  Symbols:  ${stats.totalSymbols}`);
+    console.log(`  Imports:  ${stats.totalImports}`);
+
+    if (stats.lastBuilt) {
+      console.log(`  Built:    ${new Date(stats.lastBuilt).toISOString()}`);
+    } else {
+      console.log(chalk.yellow(`  No index built yet. Run "laol indexer build" first.`));
+    }
+
+    if (Object.keys(stats.symbolsByKind).length > 0) {
+      console.log(chalk.bold("\n  By kind:"));
+      for (const [kind, count] of Object.entries(stats.symbolsByKind).sort()) {
+        console.log(`    ${kind}: ${count}`);
+      }
+    }
   });
 
 // ---- helpers ----

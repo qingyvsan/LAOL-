@@ -148,12 +148,74 @@ export interface MergeAttempt {
 
 // --- Symbol Definition (from tree-sitter AST parse) ---
 
+/**
+ * JSDoc documentation extracted from a symbol.
+ */
+export interface JsDocInfo {
+  description: string;
+  tags: { name: string; text: string }[];
+  params: { name: string; text: string }[];
+  returns: string;
+}
+
+/**
+ * A parameter of a function, method, or constructor.
+ */
+export interface ParamInfo {
+  name: string;
+  type: string;
+  optional: boolean;
+  isRest: boolean;
+  defaultValue?: string;
+}
+
+/**
+ * A function call site found inside a symbol's body.
+ */
+export interface CallInfo {
+  name: string;
+  line: number;
+}
+
+/**
+ * An import declaration at file level.
+ */
+export interface ImportInfo {
+  moduleSpecifier: string;
+  namedImports: string[];
+  defaultImport: string | null;
+  namespaceImport: string | null;
+}
+
 export interface SymbolDef {
   name: string;
   kind: "function" | "class" | "const" | "let" | "var" | "export" | "interface" | "type";
   range: [number, number]; // line range
   exported: boolean;
+  // Rich metadata (optional — backward compatible with SymbolResolver)
+  jsDoc?: JsDocInfo;
+  parameters?: ParamInfo[];
+  returnType?: string;
+  calls?: CallInfo[];
 }
+
+// --- Codebase Index ---
+
+/**
+ * A single indexed file's complete symbol information.
+ */
+export interface IndexedFile {
+  file: string;
+  symbols: SymbolDef[];
+  imports: ImportInfo[];
+  hash: string;
+  indexed_at: number;
+}
+
+/**
+ * The full codebase index, keyed by relative file path.
+ */
+export type CodebaseIndex = Record<string, IndexedFile>;
 
 // --- Lock Acquisition Result ---
 
@@ -211,5 +273,15 @@ export interface LaolConfig {
     allowed_tools: string[];
     effort: "low" | "medium" | "high" | "max";
     skip_permissions: boolean;
+  };
+  codebase_indexer: {
+    /** Glob patterns for files to include. */
+    include: string[];
+    /** Glob patterns for files to exclude. */
+    exclude: string[];
+    /** Whether to auto-index on file changes (reserved for future use). */
+    auto_index: boolean;
+    /** Debounce interval in ms for auto-indexing. */
+    index_interval_ms: number;
   };
 }

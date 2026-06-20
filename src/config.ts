@@ -44,6 +44,22 @@ export const DEFAULT_CONFIG: LaolConfig = {
     effort: "high",
     skip_permissions: true,
   },
+  codebase_indexer: {
+    include: ["src/**/*.ts", "src/**/*.tsx"],
+    exclude: [
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/build/**",
+      "**/.multiagent/**",
+      "**/__tests__/**",
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "**/*.spec.ts",
+      "**/*.spec.tsx",
+    ],
+    auto_index: true,
+    index_interval_ms: 60000,
+  },
 };
 
 /**

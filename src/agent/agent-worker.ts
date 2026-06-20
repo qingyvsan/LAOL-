@@ -198,6 +198,9 @@ export class AgentWorker {
         throw err;
       }
 
+      // 10b. Codebase index hints — query index for relevant symbols
+      contextHints.push(...(await this.collectIndexHints(task)));
+
       // 11. Execute the actual AI work
       console.log(`[agent ${this.agentId}] Starting work on task ${taskId.slice(0, 8)}`);
       await executor(handle.path, task, contextHints);
@@ -250,6 +253,62 @@ export class AgentWorker {
 
     this.activeLockFiles.push(...grantedFiles);
     return grantedFiles;
+  }
+
+  /**
+   * Query the codebase index for symbols relevant to the task description.
+   *
+   * Extracts keywords from the task, queries the CodebaseIndexer, and returns
+   * formatted context hints the agent can use to locate relevant code.
+   * Silently returns empty array if the index doesn't exist or has no matches.
+   */
+  private async collectIndexHints(task: Task): Promise<string[]> {
+    try {
+      const { CodebaseIndexer } = await import("../codebase/indexer");
+      const indexer = new CodebaseIndexer(this.repoRoot);
+
+      // Extract meaningful keywords from task description
+      const keywords = task.description
+        .split(/[\s,;:.!?()\[\]{}"']+/)
+        .map((w) => w.toLowerCase())
+        .filter((w) => w.length > 3 && !/^(this|that|with|from|into|when|then)$/.test(w));
+
+      // Deduplicate while preserving order
+      const unique = [...new Set(keywords)].slice(0, 5);
+
+      const hints: string[] = [];
+      for (const kw of unique) {
+        const results = indexer.query(kw);
+        if (results.length === 0) continue;
+
+        const top = results.slice(0, 3);
+        const lines = top.map((r) => {
+          const parts: string[] = [];
+          parts.push(`${r.symbol.kind} \`${r.symbol.name}\``);
+          parts.push(`in ${r.file}:${r.symbol.range[0]}`);
+          if (r.symbol.jsDoc?.description) {
+            const desc = r.symbol.jsDoc.description.slice(0, 120);
+            parts.push(`— ${desc}`);
+          }
+          if (r.symbol.parameters && r.symbol.parameters.length > 0) {
+            const sig = r.symbol.parameters
+              .map((p) => `${p.name}${p.optional ? "?" : ""}: ${p.type}`)
+              .join(", ");
+            parts.push(`(${sig})`);
+          }
+          return parts.join(" ");
+        });
+
+        hints.push(
+          `[CODEBASE INDEX] Symbols matching "${kw}" (${results.length} total):\n${lines.join("\n")}`
+        );
+      }
+
+      return hints;
+    } catch {
+      // Index may not exist or be corrupted — silently skip
+      return [];
+    }
   }
 
   // ---- Lifecycle ----
@@ -356,6 +415,9 @@ export class AgentWorker {
       }
       throw err;
     }
+
+    // Codebase index hints for read-only analysis — helps the agent locate relevant code
+    contextHints.push(...(await this.collectIndexHints(task)));
 
     // Execute the AI analysis
     console.log(`[agent ${this.agentId}] Starting read-only analysis for task ${taskId.slice(0, 8)}`);

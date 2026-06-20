@@ -100,6 +100,87 @@ export const MergeCheckSchema = z.object({
   timeout: z.number().positive(),
 });
 
+// --- JsDoc Info ---
+
+export const JsDocInfoSchema = z.object({
+  description: z.string().default(""),
+  tags: z.array(z.object({ name: z.string(), text: z.string() })).default([]),
+  params: z.array(z.object({ name: z.string(), text: z.string() })).default([]),
+  returns: z.string().default(""),
+});
+
+// --- Param Info ---
+
+export const ParamInfoSchema = z.object({
+  name: z.string(),
+  type: z.string().default("any"),
+  optional: z.boolean().default(false),
+  isRest: z.boolean().default(false),
+  defaultValue: z.string().optional(),
+});
+
+// --- Call Info ---
+
+export const CallInfoSchema = z.object({
+  name: z.string(),
+  line: z.number().int().positive(),
+});
+
+// --- Import Info ---
+
+export const ImportInfoSchema = z.object({
+  moduleSpecifier: z.string(),
+  namedImports: z.array(z.string()).default([]),
+  defaultImport: z.string().nullable().default(null),
+  namespaceImport: z.string().nullable().default(null),
+});
+
+// --- SymbolDef (extended) ---
+
+export const SymbolDefSchema = z.object({
+  name: z.string(),
+  kind: z.enum(["function", "class", "const", "let", "var", "export", "interface", "type"]),
+  range: z.tuple([z.number().int().positive(), z.number().int().positive()]),
+  exported: z.boolean(),
+  jsDoc: JsDocInfoSchema.optional(),
+  parameters: z.array(ParamInfoSchema).optional(),
+  returnType: z.string().optional(),
+  calls: z.array(CallInfoSchema).optional(),
+});
+
+// --- Indexed File ---
+
+export const IndexedFileSchema = z.object({
+  file: z.string(),
+  symbols: z.array(SymbolDefSchema),
+  imports: z.array(ImportInfoSchema),
+  hash: z.string(),
+  indexed_at: z.number().positive(),
+});
+
+// --- Codebase Index ---
+
+export const CodebaseIndexSchema = z.record(z.string(), IndexedFileSchema);
+
+// --- Codebase Indexer Config ---
+
+export const CodebaseIndexerConfigSchema = z.object({
+  include: z.array(z.string()).default(["src/**/*.ts", "src/**/*.tsx"]),
+  exclude: z.array(z.string()).default([
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/.multiagent/**",
+    "**/__tests__/**",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.spec.ts",
+    "**/*.spec.tsx",
+  ]),
+  auto_index: z.boolean().default(true),
+  index_interval_ms: z.number().int().min(1000).default(60000),
+});
+
 // --- Laol Config ---
 
 export const LaolConfigSchema = z.object({
@@ -143,6 +224,7 @@ export const LaolConfigSchema = z.object({
     effort: z.enum(["low", "medium", "high", "max"]).default("high"),
     skip_permissions: z.boolean().default(true),
   }),
+  codebase_indexer: CodebaseIndexerConfigSchema,
 });
 
 // --- Derived types ---
