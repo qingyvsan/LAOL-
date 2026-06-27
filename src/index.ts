@@ -18,6 +18,7 @@ export type { ClaudeExecutionResult } from "./agent/claude-executor";
 export { Heartbeat } from "./agent/heartbeat";
 export { Checkpoint, RebaseConflictError } from "./agent/checkpoint";
 export { Perception } from "./agent/perception";
+export { CodebaseIndexer } from "./codebase/indexer";
 export { WorktreePool } from "./worktree/pool";
 export { MergeDriver } from "./merge/merge-driver";
 export { parseConflictBlocks, rebuildFile, hasConflictMarkers } from "./merge/conflict-parser";

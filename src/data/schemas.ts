@@ -212,7 +212,6 @@ export const LaolConfigSchema = z.object({
   agent: z.object({
     heartbeat_interval_ms: z.number().int().min(5000).default(25000),
     checkpoint_min_interval_ms: z.number().int().min(10000).default(30000),
-    perception_check_interval_ms: z.number().int().min(5000).default(15000),
   }),
   locks: z.object({
     initial_ttl_ms: z.number().int().min(10000).default(60000),
@@ -228,7 +227,42 @@ export const LaolConfigSchema = z.object({
     effort: z.enum(["low", "medium", "high", "max"]).default("high"),
     skip_permissions: z.boolean().default(true),
   }),
-  codebase_indexer: CodebaseIndexerConfigSchema,
+  codebase_indexer: CodebaseIndexerConfigSchema.optional(),
+  context_providers: z.record(
+    z.string(),
+    z.object({
+      enabled: z.boolean(),
+      include: z.array(z.string()).optional(),
+      timeout_seconds: z.number().int().min(1).max(600),
+      options: z.record(z.unknown()).optional(),
+    })
+  ).default({}),
+});
+
+// --- Context Provider Schemas ---
+
+export const ContextHintSchema = z.object({
+  source: z.string().min(1),
+  priority: z.enum(["high", "medium", "low"]),
+  title: z.string().min(1),
+  content: z.string(),
+  artifactPath: z.string().optional(),
+  timestamp: z.number().positive(),
+});
+
+export const ProviderDeltaSchema = z.object({
+  source: z.string().min(1),
+  before: z.object({ errors: z.number().int().min(0), warnings: z.number().int().min(0) }),
+  after: z.object({ errors: z.number().int().min(0), warnings: z.number().int().min(0) }),
+  fixed: z.array(z.string()),
+  introduced: z.array(z.string()),
+});
+
+export const ContextProviderConfigSchema = z.object({
+  enabled: z.boolean(),
+  include: z.array(z.string()).optional(),
+  timeout_seconds: z.number().int().min(1).max(600),
+  options: z.record(z.unknown()).optional(),
 });
 
 // --- Derived types ---

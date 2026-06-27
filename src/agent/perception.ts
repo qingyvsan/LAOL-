@@ -1,34 +1,23 @@
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { watch, FSWatcher } from "chokidar";
-import type { Lock } from "../data/models";
 
 /**
  * Perception — the agent's "eyes and ears" on the rest of the system.
  *
- * Two mechanisms:
- * 1. Passive (chokidar on locks/): detects new/removed locks in the
- *    same module directory as the agent's target files.
+ * Watches the .multiagent/locks/ directory for real-time lock acquisition
+ * by other agents. When another agent acquires a lock in the same module
+ * directory as this agent's target files, it logs a warning.
  *
- * 2. Active (warnings file): before each LLM call, checks if
- *    .multiagent/warnings/{taskId}.md exists. If yes, reads it and
- *    returns the content for injection into the system prompt.
- *    The warning file is deleted after consumption.
+ * This is an optional component — GitProvider.agentActivity() provides
+ * equivalent point-in-time information via the ContextManager pipeline.
+ * Use Perception when real-time lock notifications are desired.
  */
-
-export interface PerceptionWarning {
-  message: string;
-  severity: "info" | "warning" | "critical";
-}
 
 export class Perception {
   private repoRoot: string;
   private taskId: string;
   private targetFiles: string[];
   private watcher: FSWatcher | null = null;
-
-  // Callbacks
-  private onWarning: ((warning: PerceptionWarning) => void) | null = null;
 
   constructor(
     repoRoot: string,
@@ -41,14 +30,9 @@ export class Perception {
   }
 
   /**
-   * Register a callback for perception warnings.
-   */
-  setOnWarning(cb: (warning: PerceptionWarning) => void): void {
-    this.onWarning = cb;
-  }
-
-  /**
    * Start watching the locks/ directory for relevant changes.
+   * Logs a console warning when another agent acquires a lock
+   * in the same module directory as our target files.
    */
   start(): FSWatcher {
     if (this.watcher) return this.watcher;
@@ -75,13 +59,10 @@ export class Perception {
       const lockModule = path.dirname(filePath);
 
       if (ourModules.has(lockModule) && !this.targetFiles.includes(filePath)) {
-        // A file in our module directory is being modified by someone else
-        if (this.onWarning) {
-          this.onWarning({
-            message: `Another agent is now modifying "${filePath}" in your module directory "${lockModule}". Watch for conflicts.`,
-            severity: "warning",
-          });
-        }
+        console.warn(
+          `[perception] Another agent is now modifying "${filePath}" ` +
+          `in your module directory "${lockModule}". Watch for conflicts.`
+        );
       }
     });
 
@@ -100,79 +81,5 @@ export class Perception {
       await this.watcher.close();
       this.watcher = null;
     }
-  }
-
-  /**
-   * Check for and consume the semantic warning file for this task.
-   * Called before each LLM call. Returns the warning content if any,
-   * and deletes the file after reading (single consumption).
-   */
-  checkWarnings(): string | null {
-    const warningPath = path.join(
-      this.repoRoot,
-      ".multiagent",
-      "warnings",
-      `${this.taskId}.md`
-    );
-
-    if (!fs.existsSync(warningPath)) return null;
-
-    try {
-      const content = fs.readFileSync(warningPath, "utf-8");
-      // Consume the warning (delete after reading)
-      fs.unlinkSync(warningPath);
-      return content;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Get the current lock landscape for context injection.
-   * Returns a human-readable summary of active locks in relevant modules.
-   */
-  getContextSummary(): string {
-    const locksDir = path.join(this.repoRoot, ".multiagent", "locks");
-
-    if (!fs.existsSync(locksDir)) return "";
-
-    const ourModules = new Set(
-      this.targetFiles.map((f) => path.dirname(f))
-    );
-
-    const relevantLocks: { file: string; holder: string }[] = [];
-
-    try {
-      const lockFiles = fs.readdirSync(locksDir).filter((f) => f.endsWith(".lock"));
-
-      for (const lf of lockFiles) {
-        const desanitized = lf.replace(".lock", "").replace(/#/g, "/");
-        const lockModule = path.dirname(desanitized);
-
-        if (ourModules.has(lockModule)) {
-          try {
-            const raw = JSON.parse(
-              fs.readFileSync(path.join(locksDir, lf), "utf-8")
-            );
-            relevantLocks.push({
-              file: raw.file ?? desanitized,
-              holder: raw.holder ?? "unknown",
-            });
-          } catch {
-            // Skip malformed lock files
-          }
-        }
-      }
-    } catch {
-      // Can't read locks
-    }
-
-    if (relevantLocks.length === 0) return "";
-
-    const lines = relevantLocks.map(
-      (l) => `  - ${l.file} (held by ${l.holder})`
-    );
-
-    return `\n[LAOL Perception] Active locks in your modules:\n${lines.join("\n")}\n`;
   }
 }

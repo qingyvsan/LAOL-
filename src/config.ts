@@ -28,7 +28,6 @@ export const DEFAULT_CONFIG: LaolConfig = {
   agent: {
     heartbeat_interval_ms: 25000,
     checkpoint_min_interval_ms: 30000,
-    perception_check_interval_ms: 15000,
   },
   locks: {
     initial_ttl_ms: 60000,
@@ -63,6 +62,47 @@ export const DEFAULT_CONFIG: LaolConfig = {
     ],
     auto_index: true,
     index_interval_ms: 60000,
+  },
+  context_providers: {
+    typescript: {
+      enabled: true,
+      include: ["src/**/*.ts", "src/**/*.tsx"],
+      timeout_seconds: 60,
+    },
+    eslint: {
+      enabled: true,
+      include: ["src/**/*.ts", "src/**/*.tsx"],
+      timeout_seconds: 30,
+    },
+    test: {
+      enabled: true,
+      timeout_seconds: 120,
+      options: {
+        test_patterns: ["**/*.test.ts", "**/*.spec.ts", "**/*.test.tsx", "**/*.spec.tsx"],
+        file_to_test_mapping: "convention",
+      },
+    },
+    git: {
+      enabled: true,
+      timeout_seconds: 10,
+    },
+    custom: {
+      enabled: false,
+      timeout_seconds: 60,
+      options: {
+        pre_commands: [],
+        post_commands: [],
+      },
+    },
+    python: {
+      enabled: true,
+      include: ["**/*.py"],
+      timeout_seconds: 60,
+    },
+    codebase: {
+      enabled: true,
+      timeout_seconds: 10,
+    },
   },
 };
 

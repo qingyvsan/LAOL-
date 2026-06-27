@@ -7,10 +7,11 @@ import { LeaseManager } from "../lock/lease-manager";
 import { WorktreePool } from "../worktree/pool";
 import { Heartbeat } from "./heartbeat";
 import { Checkpoint, RebaseConflictError } from "./checkpoint";
-import { Perception } from "./perception";
 import { SocketClient } from "../events/socket-client";
 import { RegistryManager } from "../registry/registry-manager";
 import { KnowledgeStore } from "../knowledge/knowledge-store";
+import { ContextManager } from "../context/manager";
+import { CodebaseIndexer } from "../codebase/indexer";
 import { loadConfig } from "../config";
 import type { Task, LaolConfig } from "../data/models";
 
@@ -49,12 +50,12 @@ export class AgentWorker {
   private socketClient: SocketClient;
   private registryManager: RegistryManager;
   private knowledgeStore: KnowledgeStore;
+  private contextManager: ContextManager;
 
   // Per-task state
   private currentTask: Task | null = null;
   private heartbeat: Heartbeat;
   private checkpoint: Checkpoint | null = null;
-  private perception: Perception | null = null;
 
   // Getter for heartbeat to access current lock files
   private activeLockFiles: string[] = [];
@@ -81,6 +82,7 @@ export class AgentWorker {
     this.socketClient = socketClient;
     this.registryManager = registryManager;
     this.knowledgeStore = knowledgeStore;
+    this.contextManager = new ContextManager(repoRoot, this.config);
 
     this.heartbeat = new Heartbeat(lockManager, leaseManager, agentId);
   }
@@ -165,27 +167,16 @@ export class AgentWorker {
       // 7. Start heartbeat (now that we have locks)
       this.heartbeat.start(() => this.activeLockFiles);
 
-      // 8. Start perception
-      this.perception = new Perception(this.repoRoot, taskId,
-        this.activeLockFiles.length > 0 ? this.activeLockFiles : task.target_files);
-      this.perception.start();
-
-      // 9. Collect context hints
+      // 8. Collect context hints from live providers
       const contextHints: string[] = [];
 
-      // Check warnings
-      const warnings = this.perception.checkWarnings();
-      if (warnings) {
-        contextHints.push(`[SEMANTIC WARNINGS]\n${warnings}`);
-      }
+      const { hints: liveHints, preStates } = await this.contextManager.collectPreHints(
+        task,
+        handle.path
+      );
+      contextHints.push(...liveHints.map((h) => ContextManager.formatHint(h)));
 
-      // Check perception context
-      const ctxSummary = this.perception.getContextSummary();
-      if (ctxSummary) {
-        contextHints.push(ctxSummary);
-      }
-
-      // 10. Pre-work checkpoint
+      // 10. Pre-work checkpoint (structural — rebase before editing)
       try {
         const result = this.checkpoint.checkAndRebase();
         if (result.updated && result.message) {
@@ -199,10 +190,7 @@ export class AgentWorker {
         throw err;
       }
 
-      // 10b. Codebase index hints — query index for relevant symbols
-      contextHints.push(...(await this.collectIndexHints(task)));
-
-      // 10c. Predecessor context — what the dependency task did
+      // 10b. Predecessor context — what the dependency task did (structural)
       const predecessorHint = this.buildPredecessorHint(task);
       if (predecessorHint) {
         contextHints.push(predecessorHint);
@@ -212,8 +200,41 @@ export class AgentWorker {
       console.log(`[agent ${this.agentId}] Starting work on task ${taskId.slice(0, 8)}`);
       await executor(handle.path, task, contextHints);
 
+      // 11b. Collect post-task deltas from live providers
+      const { deltas } = await this.contextManager.collectPostHints(
+        task,
+        handle.path,
+        preStates
+      );
+      // Write deltas to knowledge store for other agents
+      if (deltas.length > 0) {
+        this.knowledgeStore.save({
+          task_id: taskId,
+          agent_id: this.agentId,
+          description: `Post-task provider deltas for task ${taskId.slice(0, 8)}`,
+          summary: `Provider deltas: ${deltas
+            .map((d) => `${d.source}(errors: ${d.before.errors}→${d.after.errors})`)
+            .join(", ")}`,
+          files: this.activeLockFiles,
+          created_at: Date.now(),
+        });
+      }
+
       // 12. Commit changes
       this.commitChanges(handle.path, task);
+
+      // 12b. Re-index modified files so the shared symbol index stays fresh
+      if (this.config.codebase_indexer?.auto_index) {
+        try {
+          const indexer = new CodebaseIndexer(this.repoRoot);
+          indexer.reindexFiles(this.activeLockFiles, handle.path);
+        } catch (err) {
+          // Non-fatal: index rebuild failure must not block task completion
+          console.warn(
+            `[agent ${this.agentId}] Index rebuild warning: ${err}`
+          );
+        }
+      }
 
       // 13. Push branch
       this.pushBranch(handle.path, task);
@@ -260,62 +281,6 @@ export class AgentWorker {
 
     this.activeLockFiles.push(...grantedFiles);
     return grantedFiles;
-  }
-
-  /**
-   * Query the codebase index for symbols relevant to the task description.
-   *
-   * Extracts keywords from the task, queries the CodebaseIndexer, and returns
-   * formatted context hints the agent can use to locate relevant code.
-   * Silently returns empty array if the index doesn't exist or has no matches.
-   */
-  private async collectIndexHints(task: Task): Promise<string[]> {
-    try {
-      const { CodebaseIndexer } = await import("../codebase/indexer");
-      const indexer = new CodebaseIndexer(this.repoRoot);
-
-      // Extract meaningful keywords from task description
-      const keywords = task.description
-        .split(/[\s,;:.!?()\[\]{}"']+/)
-        .map((w) => w.toLowerCase())
-        .filter((w) => w.length > 3 && !/^(this|that|with|from|into|when|then)$/.test(w));
-
-      // Deduplicate while preserving order
-      const unique = [...new Set(keywords)].slice(0, 5);
-
-      const hints: string[] = [];
-      for (const kw of unique) {
-        const results = indexer.query(kw);
-        if (results.length === 0) continue;
-
-        const top = results.slice(0, 3);
-        const lines = top.map((r) => {
-          const parts: string[] = [];
-          parts.push(`${r.symbol.kind} \`${r.symbol.name}\``);
-          parts.push(`in ${r.file}:${r.symbol.range[0]}`);
-          if (r.symbol.jsDoc?.description) {
-            const desc = r.symbol.jsDoc.description.slice(0, 120);
-            parts.push(`— ${desc}`);
-          }
-          if (r.symbol.parameters && r.symbol.parameters.length > 0) {
-            const sig = r.symbol.parameters
-              .map((p) => `${p.name}${p.optional ? "?" : ""}: ${p.type}`)
-              .join(", ");
-            parts.push(`(${sig})`);
-          }
-          return parts.join(" ");
-        });
-
-        hints.push(
-          `[CODEBASE INDEX] Symbols matching "${kw}" (${results.length} total):\n${lines.join("\n")}`
-        );
-      }
-
-      return hints;
-    } catch {
-      // Index may not exist or be corrupted — silently skip
-      return [];
-    }
   }
 
   // ---- Lifecycle ----
@@ -402,12 +367,18 @@ export class AgentWorker {
 
     console.log(`[agent ${this.agentId}] Read-only task ${taskId.slice(0, 8)} — analysis/report mode`);
 
-    // Collect context hints (without perception, since no file modifications)
+    // Collect context hints from live providers
     const contextHints: string[] = [
       "[MODE] This is a READ-ONLY analysis task. Do NOT modify any files. " +
       "Explore the codebase, analyze, and report your findings. " +
       "Your entire response will be saved and shown to the user as a report.",
     ];
+
+    const { hints: liveHints } = await this.contextManager.collectPreHints(
+      task,
+      worktreePath
+    );
+    contextHints.push(...liveHints.map((h) => ContextManager.formatHint(h)));
 
     // Pre-work checkpoint (rebase to get latest code for analysis)
     try {
@@ -422,9 +393,6 @@ export class AgentWorker {
       }
       throw err;
     }
-
-    // Codebase index hints for read-only analysis — helps the agent locate relevant code
-    contextHints.push(...(await this.collectIndexHints(task)));
 
     // Predecessor context — what the dependency task did
     const predecessorHint = this.buildPredecessorHint(task);
@@ -500,12 +468,6 @@ export class AgentWorker {
   private cleanup(taskId: string): void {
     // Stop heartbeat
     this.heartbeat.stop();
-
-    // Stop perception
-    if (this.perception) {
-      this.perception.stop();
-      this.perception = null;
-    }
 
     // Release worktree
     this.worktreePool.release(taskId);

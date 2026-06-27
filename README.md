@@ -52,6 +52,26 @@ LAOL lets multiple Claude Code AI agents safely modify the same codebase **in pa
                     main branch
 ```
 
+## Context Provider System
+
+LAOL features a **live context injection pipeline** that runs real toolchains before and after each agent task, injecting structured diagnostics directly into the agent prompt. This eliminates the need for agents to waste tokens running `tsc`, `eslint`, or `git blame` themselves — the results are pre-computed.
+
+**7 built-in providers** run in parallel with individual error isolation:
+
+| Provider | What it does |
+|----------|-------------|
+| **TypeScriptProvider** | Runs `tsc --noEmit`, filters errors to target files (cap 15) |
+| **ESLintProvider** | Runs `eslint --format compact` on target TS files (cap 10) |
+| **TestProvider** | Runs related tests via vitest/jest/pytest and injects pass/fail baseline |
+| **GitProvider** | Git blame, recent commits, and active agent activity in overlapping modules |
+| **PythonProvider** | Runs `ruff check` + `mypy` with graceful degradation if tools absent |
+| **CodebaseProvider** | Queries the symbol index for target file structure (functions, classes, exports) |
+| **CustomProvider** | Executes user-defined pre/post commands from config |
+
+After the task, providers with `deactivate()` re-run to compute **before/after deltas** (errors fixed, new failures introduced), stored in the KnowledgeStore for other agents.
+
+**Token impact:** Pre-computed diagnostics reduce agent-initiated tool calls by an estimated **55-65%** — from ~2,500–8,700 tokens down to ~1,000–3,100 per task.
+
 ## Codebase Indexer
 
 LAOL includes a built-in **symbol-level codebase indexer** that extracts and indexes every function, class, interface, type alias, and variable in your project — along with their JSDoc/docstring documentation, parameter signatures, return types, imports, and call graphs.
@@ -63,10 +83,10 @@ LAOL includes a built-in **symbol-level codebase indexer** that extracts and ind
 
 The index powers two key workflows:
 
-- **Agent task localization** — Before executing a task, agents query the index for relevant symbols and receive auto-injected `[CODEBASE INDEX]` context hints. This helps the LLM understand the codebase structure without reading every file.
+- **Agent task localization** — Before executing a task, the `CodebaseProvider` queries the index for symbols in target files and injects `[CODEBASE SYMBOLS]` context hints. This helps the LLM understand the codebase structure without reading every file.
 - **API documentation** — Generate comprehensive API docs from JSDoc annotations with a single command.
 
-The index is stored at `.multiagent/codebase-index.json` and supports incremental updates — only re-parses files that have changed since the last build.
+The index is stored at `.multiagent/codebase-index.json` and supports incremental updates. When `auto_index` is enabled (default), modified files are **automatically re-indexed** after each successful agent commit — keeping the index fresh without manual intervention.
 
 ### Symbol Extraction Depth
 
@@ -88,7 +108,7 @@ The index is stored at `.multiagent/codebase-index.json` and supports incrementa
 | **Conflict Pre-Check** | Before assigning a task, the scheduler checks whether any target file is already locked. Blocked tasks stay `pending`. |
 | **Auto-Discovery** | No `--files`? No problem. Agents explore the codebase, identify target files, request locks, then proceed — all automatically. |
 | **Graded TTL Leases** | New locks: 60s TTL. After 2 successful renewals: 180s TTL. If an agent crashes, locks auto-expire within 90s (not 300s). |
-| **Semantic Warnings** | When Agent A modifies a module's exports, Agent B gets a context hint before editing that module. |
+| **Context Provider Pipeline** | Before each task, 7 live providers (tsc, eslint, vitest, git, etc.) inject diagnostics into the agent prompt. After the task, providers compute deltas so the next agent knows what changed. |
 | **Agent Circuit Breaker** | 2 consecutive failures → degraded (simple tasks only). 5 → quarantined (no tasks). Prevents broken agents from burning API costs. |
 | **Task Dependency Chains** | When Task B depends on Task A, B's worktree starts from A's branch — inheriting all code changes. Agents receive `[PREDECESSOR]` context hints describing what A did. Chain of any length: A → B → C works naturally. |
 
@@ -98,6 +118,7 @@ The index is stored at `.multiagent/codebase-index.json` and supports incrementa
 - **TCP localhost instead of Unix sockets** — cross-platform (Windows, Linux, macOS) with zero platform branches.
 - **Optimistic concurrency for tasks** (version numbers), **pessimistic locking for files** (exclusive leases).
 - **Claude Code CLI as subprocess** — agents spawn `claude -p` in isolated Git worktrees. LAOL manages the lifecycle; Claude does the coding.
+- **Live toolchain queries, not static parsing** — context providers run real compilers, linters, and test runners instead of relying solely on AST indexing. Inspired by the fennara-godot-ai live-editor-query architecture.
 
 ## Installation
 
@@ -274,8 +295,7 @@ Show system overview: task counts, lock count, pool usage.
   },
   "agent": {
     "heartbeat_interval_ms": 25000,
-    "checkpoint_min_interval_ms": 30000,
-    "perception_check_interval_ms": 15000
+    "checkpoint_min_interval_ms": 30000
   },
   "locks": {
     "initial_ttl_ms": 60000,   // New lock TTL (60s)
@@ -290,6 +310,21 @@ Show system overview: task counts, lock count, pool usage.
     "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
     "effort": "high",          // low | medium | high | max
     "skip_permissions": true   // Skip interactive permission prompts
+  },
+  "codebase_indexer": {
+    "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.py"],
+    "exclude": ["**/node_modules/**", "**/dist/**", "**/__tests__/**"],
+    "auto_index": true,         // Auto-reindex modified files after agent tasks
+    "index_interval_ms": 60000
+  },
+  "context_providers": {
+    "typescript": { "enabled": true, "timeout_seconds": 60 },
+    "eslint":     { "enabled": true, "timeout_seconds": 30 },
+    "test":       { "enabled": true, "timeout_seconds": 120 },
+    "git":        { "enabled": true, "timeout_seconds": 10 },
+    "python":     { "enabled": true, "timeout_seconds": 60 },
+    "codebase":   { "enabled": true, "timeout_seconds": 10 },
+    "custom":     { "enabled": false, "timeout_seconds": 60 }
   }
 }
 ```
@@ -327,10 +362,12 @@ Scheduler.runAssignmentLoop()
 AgentRunner.handleTaskAssigned(msg)
     │
     └── AgentWorker.executeTask(task, executor)
-        ├── Heartbeat.start()           # Renews locks every 25s
-        ├── Perception.start()          # Watches warnings/ directory
-        ├── WorktreePool.acquire()      # Grab pre-warmed worktree
-        ├── Checkpoint.checkAndRebase() # Fetch latest main, rebase if needed
+        ├── Heartbeat.start()              # Renews locks every 25s
+        ├── WorktreePool.acquire()         # Grab pre-warmed worktree
+        ├── Checkpoint.checkAndRebase()    # Fetch latest main, rebase if needed
+        │
+        ├── ContextManager.collectPreHints()   # 7 live providers: tsc, eslint, tests, git, etc.
+        │   └── Inject [TYPESCRIPT], [ESLINT], [TEST BASELINE], [GIT], [SYMBOLS], etc.
         │
         ├── ClaudeCodeExecutor.execute(worktreePath, task, hints)
         │   └── spawn("claude", ["-p", prompt, "--output-format", "text", ...])
@@ -338,12 +375,14 @@ AgentRunner.handleTaskAssigned(msg)
         │       ├── Claude makes edits
         │       └── Claude exits 0 → success
         │
+        ├── ContextManager.collectPostHints()  # Re-run providers, compute before/after deltas
         ├── git add -A && git commit
+        ├── CodebaseIndexer.reindexFiles()     # Keep symbol index fresh (when auto_index: true)
         ├── git push origin agent/{task_id}
         ├── LockManager.releaseAll()
         ├── TaskStore.updateTask(task_id, status: "done")
         ├── SocketClient.notifyTaskDone(task_id)
-        └── WorktreePool.release()      # Return worktree to pool
+        └── WorktreePool.release()         # Return worktree to pool
 ```
 
 ## Development
@@ -351,7 +390,7 @@ AgentRunner.handleTaskAssigned(msg)
 ```bash
 npm install
 npm run build       # TypeScript → dist/
-npm test            # Vitest (257 tests, 19 files)
+npm test            # Vitest (269 tests, 20 files)
 npm run dev         # Watch mode
 ```
 
@@ -364,6 +403,8 @@ src/
 ├── lock/            # Two-phase commit locks + TTL leases + symbol resolver
 ├── scheduler/       # Event-driven scheduler + conflict checker + circuit breaker + health monitor
 ├── agent/           # Agent worker + heartbeat + checkpoint + perception + Claude executor
+├── context/         # Context provider pipeline (7 providers: tsc, eslint, test, git, python, codebase, custom)
+│   └── providers/   # Individual provider implementations
 ├── worktree/        # Git worktree pool
 ├── merge/           # 3-level merge: L1 auto / L2 AST / L3 LLM + sandbox validator
 ├── events/          # EventBus (internal) + TCP socket server/client (cross-platform IPC)
@@ -371,7 +412,7 @@ src/
 ├── registry/        # Semantic change registry (module export tracking)
 ├── codebase/        # Symbol-level indexer (TS AST extraction, keyword search, API docs)
 ├── cli/             # Commander-based CLI (8 command groups)
-└── __tests__/       # 19 test files, 257 tests
+└── __tests__/       # 20 test files, 269 tests
 ```
 
 ## License

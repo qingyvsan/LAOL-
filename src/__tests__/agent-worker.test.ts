@@ -5,19 +5,17 @@ import type { Task, LaolConfig } from "../data/models";
 // ---- Mutable mock state (hoisted so vi.mock factories can access) ----
 
 const {
-  perceptionCheckWarnings,
-  perceptionGetContextSummary,
   checkpointCheckAndRebase,
   heartbeatStart,
   heartbeatStop,
   execSyncMock,
+  contextCollectPreHints,
 } = vi.hoisted(() => ({
-  perceptionCheckWarnings: vi.fn<() => string | null>().mockReturnValue(null),
-  perceptionGetContextSummary: vi.fn<() => string>().mockReturnValue(""),
   checkpointCheckAndRebase: vi.fn().mockReturnValue({ updated: false, skipped: false }),
   heartbeatStart: vi.fn(),
   heartbeatStop: vi.fn(),
   execSyncMock: vi.fn(),
+  contextCollectPreHints: vi.fn().mockResolvedValue({ hints: [], preStates: new Map() }),
 }));
 
 // ---- Module-level mocks (before imports) ----
@@ -52,11 +50,25 @@ vi.mock("../agent/perception", () => ({
   Perception: vi.fn().mockImplementation(() => ({
     start: vi.fn(),
     stop: vi.fn(),
-    setOnWarning: vi.fn(),
-    checkWarnings: perceptionCheckWarnings,
-    getContextSummary: perceptionGetContextSummary,
   })),
 }));
+
+vi.mock("../context/manager", () => {
+  const formatHint = (h: { source: string; title: string; content: string }) =>
+    `[${h.source.toUpperCase()}] ${h.title}\n${h.content}`;
+  const formatHints = (hints: typeof formatHint.arguments[]) =>
+    hints.map(formatHint).join("\n\n");
+  return {
+    ContextManager: Object.assign(
+      vi.fn().mockImplementation(() => ({
+        collectPreHints: contextCollectPreHints,
+        collectPostHints: vi.fn().mockResolvedValue({ hints: [], deltas: [] }),
+        getProviderNames: vi.fn().mockReturnValue([]),
+      })),
+      { formatHint, formatHints }
+    ),
+  };
+});
 
 vi.mock("../config", () => ({
   loadConfig: vi.fn().mockReturnValue({
@@ -73,7 +85,6 @@ vi.mock("../config", () => ({
     agent: {
       heartbeat_interval_ms: 25000,
       checkpoint_min_interval_ms: 30000,
-      perception_check_interval_ms: 15000,
     },
     locks: { initial_ttl_ms: 60000, stable_ttl_ms: 180000, stable_threshold: 2, probe_timeout_ms: 45000 },
     claude_executor: {
@@ -84,6 +95,7 @@ vi.mock("../config", () => ({
       effort: "high",
       skip_permissions: true,
     },
+    context_providers: {},
   } as LaolConfig),
 }));
 
@@ -161,8 +173,6 @@ describe("AgentWorker — lifecycle", () => {
     vi.clearAllMocks();
 
     // Reset mutable mock state to defaults
-    perceptionCheckWarnings.mockReturnValue(null);
-    perceptionGetContextSummary.mockReturnValue("");
     checkpointCheckAndRebase.mockReturnValue({ updated: false, skipped: false });
 
     // Default execSync: return an object with toString() for git commands
@@ -311,12 +321,29 @@ describe("AgentWorker — lifecycle", () => {
     );
   });
 
-  // ---- Perception warnings ----
+  // ---- Context provider hints ----
 
-  it("collects perception warnings and passes them to executor as context hints", async () => {
+  it("collects context provider hints and passes them to executor", async () => {
     const task = makeTask();
-    perceptionCheckWarnings.mockReturnValue("Warning: shared module modified!");
-    perceptionGetContextSummary.mockReturnValue("[Context] Active locks: src/utils.ts by agent-2");
+    contextCollectPreHints.mockResolvedValue({
+      hints: [
+        {
+          source: "git",
+          priority: "high",
+          title: "Warning: shared module modified!",
+          content: "Warning: shared module modified by agent-2",
+          timestamp: Date.now(),
+        },
+        {
+          source: "git",
+          priority: "medium",
+          title: "Agent activity: 1 active in same module",
+          content: "Active locks: src/utils.ts by agent-2",
+          timestamp: Date.now(),
+        },
+      ],
+      preStates: new Map([["git", {}]]),
+    });
 
     let capturedHints: string[] = [];
     const executor = vi.fn().mockImplementation((_path, _task, hints: string[]) => {
@@ -330,9 +357,9 @@ describe("AgentWorker — lifecycle", () => {
     expect(capturedHints.some((h) => h.includes("Active locks"))).toBe(true);
   });
 
-  it("does not include warning hint when no warnings", async () => {
+  it("does not include context hints when none returned", async () => {
     const task = makeTask();
-    // Default mocks return null / empty
+    contextCollectPreHints.mockResolvedValue({ hints: [], preStates: new Map() });
 
     let capturedHints: string[] = [];
     const executor = vi.fn().mockImplementation((_path, _task, hints: string[]) => {

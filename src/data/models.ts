@@ -236,6 +236,110 @@ export interface WorktreeEntry {
 
 // --- Laol Configuration ---
 
+// --- Context Provider System ---
+
+/**
+ * A single context hint produced by a provider.
+ * Injected into the agent's prompt before task execution.
+ */
+export interface ContextHint {
+  /** Provider that produced this hint, e.g. "typescript", "git", "test". */
+  source: string;
+  /** Importance level. High-priority hints are injected first. */
+  priority: "high" | "medium" | "low";
+  /** One-line summary shown to the agent. */
+  title: string;
+  /** Markdown content injected into the agent's prompt. */
+  content: string;
+  /** Optional path to a file with the full raw output (large outputs go here, not in content). */
+  artifactPath?: string;
+  /** Unix timestamp ms when the hint was produced. */
+  timestamp: number;
+}
+
+/**
+ * Before/after comparison produced by a provider's deactivate() method.
+ */
+export interface ProviderDelta {
+  /** Provider that produced this delta, e.g. "typescript". */
+  source: string;
+  /** Pre-task counts. */
+  before: { errors: number; warnings: number };
+  /** Post-task counts. */
+  after: { errors: number; warnings: number };
+  /** Issues that existed before but are now resolved. */
+  fixed: string[];
+  /** Issues that did not exist before but appeared after the task. */
+  introduced: string[];
+}
+
+/**
+ * Per-provider configuration in .multiagent/config.json.
+ */
+export interface ContextProviderConfig {
+  /** Whether this provider is active. */
+  enabled: boolean;
+  /** Glob patterns for files this provider cares about. If omitted, applies to all files. */
+  include?: string[];
+  /** Max execution time in seconds. */
+  timeout_seconds: number;
+  /** Provider-specific options (e.g. test runner binary path). */
+  options?: Record<string, unknown>;
+}
+
+/**
+ * Interface implemented by every context provider.
+ *
+ * Each provider queries a live system (compiler, linter, test runner, git, etc.)
+ * and returns structured hints that get injected into the agent's prompt.
+ *
+ * Providers are instantiated per-task. The ContextManager runs activate()
+ * before the agent starts and deactivate() after it finishes to compute deltas.
+ */
+export interface ContextProvider {
+  /** Unique provider name, e.g. "typescript", "eslint", "test", "git". */
+  readonly name: string;
+  /** Human-readable description for status/logging output. */
+  readonly description: string;
+
+  /**
+   * Whether this provider is relevant for the given task.
+   * Called before activate() — providers that return false are skipped.
+   */
+  applies(task: Task): boolean;
+
+  /**
+   * Run before the agent starts work.
+   * @param worktreePath - Absolute path to the isolated worktree.
+   * @param task - The task being executed.
+   * @returns Context hints to inject into the agent prompt.
+   */
+  activate(worktreePath: string, task: Task): Promise<ContextHint[]>;
+
+  /**
+   * Run after the agent finishes work. Optional — if not provided,
+   * no post-task comparison is performed for this provider.
+   * @param worktreePath - Absolute path to the isolated worktree.
+   * @param task - The completed task.
+   * @param preState - Opaque state returned by activate() via ContextHint metadata.
+   * @returns Post-task hints and an optional before/after delta.
+   */
+  deactivate?(
+    worktreePath: string,
+    task: Task,
+    preState: unknown
+  ): Promise<{ hints: ContextHint[]; delta: ProviderDelta | null }>;
+}
+
+/**
+ * Stored state from a provider's activate() phase, passed to deactivate().
+ */
+export interface LiveContextState {
+  providerName: string;
+  /** Opaque payload the provider uses to compute the delta. */
+  payload: unknown;
+}
+
 export interface LaolConfig {
   scheduler: {
     port: number;
@@ -258,7 +362,6 @@ export interface LaolConfig {
   agent: {
     heartbeat_interval_ms: number;
     checkpoint_min_interval_ms: number;
-    perception_check_interval_ms: number;
   };
   locks: {
     initial_ttl_ms: number;
@@ -279,9 +382,11 @@ export interface LaolConfig {
     include: string[];
     /** Glob patterns for files to exclude. */
     exclude: string[];
-    /** Whether to auto-index on file changes (reserved for future use). */
+    /** Whether to re-index modified files after agent tasks complete. */
     auto_index: boolean;
     /** Debounce interval in ms for auto-indexing. */
     index_interval_ms: number;
   };
+  /** Live context providers that query toolchains before/after agent tasks. */
+  context_providers: Record<string, ContextProviderConfig>;
 }

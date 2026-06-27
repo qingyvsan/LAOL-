@@ -99,6 +99,39 @@ export class CodebaseIndexer {
   }
 
   /**
+   * Re-index specific files, reading their contents from an optional source
+   * directory (e.g. a worktree). Updates the shared index in-place.
+   *
+   * Used to keep the index fresh after agent file modifications without
+   * requiring a full rebuild. Files that don't exist on disk are skipped.
+   */
+  reindexFiles(filePaths: string[], sourcePath?: string): void {
+    const index = this.loadIndex();
+    const basePath = sourcePath ?? this.repoRoot;
+
+    for (const rawPath of filePaths) {
+      const relPath = rawPath.replace(/\\/g, "/");
+      const absPath = path.join(basePath, rawPath);
+
+      if (!fs.existsSync(absPath)) continue;
+
+      const extracted = this.extractor.extract(absPath);
+      if (extracted) {
+        const hash = SymbolExtractor.hashFile(absPath);
+        index[relPath] = {
+          file: relPath,
+          symbols: extracted.symbols,
+          imports: extracted.imports,
+          hash,
+          indexed_at: Date.now(),
+        };
+      }
+    }
+
+    this.saveIndex(index);
+  }
+
+  /**
    * Search the index for symbols matching a keyword.
    * Returns results sorted by relevance (highest first).
    */

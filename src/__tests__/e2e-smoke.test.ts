@@ -56,7 +56,7 @@ describe("E2E Smoke — full pipeline", () => {
       path.join(repoDir, ".multiagent", "config.json"),
       JSON.stringify({
         scheduler: { port: 9123, pool_size: 4 },
-        agent: { heartbeat_interval_ms: 25000, checkpoint_min_interval_ms: 30000, perception_check_interval_ms: 15000 },
+        agent: { heartbeat_interval_ms: 25000, checkpoint_min_interval_ms: 30000 },
         locks: { initial_ttl_ms: 60000, stable_ttl_ms: 180000, stable_threshold: 2, probe_timeout_ms: 45000 },
         claude_executor: { binary_path: "claude", timeout_seconds: 300, max_budget_usd: 5, allowed_tools: ["Read"], effort: "high", skip_permissions: true },
         merge_checks: [],
