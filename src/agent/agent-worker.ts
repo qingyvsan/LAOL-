@@ -16,6 +16,18 @@ import { loadConfig } from "../config";
 import type { Task, LaolConfig } from "../data/models";
 
 /**
+ * Error thrown when an interactive terminal session times out.
+ * Distinct from general failures — caught by failTask() to mark the
+ * task as "stuck" (recoverable) instead of "failed" (terminal).
+ */
+export class InteractiveTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InteractiveTimeoutError";
+  }
+}
+
+/**
  * Agent Worker — manages the full lifecycle of a single task execution.
  *
  * Sequence:
@@ -56,6 +68,7 @@ export class AgentWorker {
   private currentTask: Task | null = null;
   private heartbeat: Heartbeat;
   private checkpoint: Checkpoint | null = null;
+  private interactiveTimeout = false;
 
   // Getter for heartbeat to access current lock files
   private activeLockFiles: string[] = [];
@@ -254,7 +267,7 @@ export class AgentWorker {
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       console.error(`[agent ${this.agentId}] Task ${taskId.slice(0, 8)} failed: ${reason}`);
-      this.failTask(taskId, reason);
+      this.failTask(taskId, reason, err);
     } finally {
       // Cleanup regardless of outcome
       this.cleanup(taskId);
@@ -449,7 +462,28 @@ export class AgentWorker {
     console.log(`[agent ${this.agentId}] Task ${taskId.slice(0, 8)} DONE (read-only)`);
   }
 
-  private failTask(taskId: string, reason: string): void {
+  private failTask(taskId: string, reason: string, error?: unknown): void {
+    // Interactive timeout: mark as stuck instead of failed so the user can resume.
+    // Keep locks and worktree intact — changes are preserved in the agent branch.
+    if (error instanceof InteractiveTimeoutError) {
+      this.interactiveTimeout = true;
+
+      // Mark as stuck with worktree info for recovery
+      this.taskStore.updateTask(taskId, () => ({
+        status: "stuck",
+        metadata: {
+          failure_reason: reason,
+          _interactive_timeout: true,
+          _worktree_branch: `agent/${taskId}`,
+          _agent_id: this.agentId,
+        },
+      }));
+
+      // Notify scheduler (task is stuck, not failed — dependency cascade is blocked)
+      this.socketClient.notifyTaskFailed(taskId, `Interactive timeout: ${reason}`);
+      return;
+    }
+
     // Release locks
     for (const file of this.activeLockFiles) {
       this.lockManager.release(file);
@@ -468,6 +502,21 @@ export class AgentWorker {
   private cleanup(taskId: string): void {
     // Stop heartbeat
     this.heartbeat.stop();
+
+    // For interactive timeout: keep the worktree so the user can resume.
+    // The worktree branch has the in-progress changes; releasing it would
+    // reset them and lose work.
+    if (this.interactiveTimeout) {
+      console.log(
+        `[agent ${this.agentId}] Interactive session timed out — ` +
+        `preserving worktree and locks for recovery.`
+      );
+      this.interactiveTimeout = false;
+      this.activeLockFiles = [];
+      this.currentTask = null;
+      this.checkpoint = null;
+      return;
+    }
 
     // Release worktree
     this.worktreePool.release(taskId);

@@ -28,6 +28,12 @@ export const DEFAULT_CONFIG: LaolConfig = {
   agent: {
     heartbeat_interval_ms: 25000,
     checkpoint_min_interval_ms: 30000,
+    mode: "interactive",
+    interactive: {
+      terminal_timeout_seconds: 7200,
+      poll_interval_ms: 2000,
+      session_dir: "sessions",
+    },
   },
   locks: {
     initial_ttl_ms: 60000,

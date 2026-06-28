@@ -101,7 +101,7 @@ export class ContextManager {
             hints: [
               {
                 source: provider.name,
-                priority: "low",
+                priority: "low" as const,
                 title: `${provider.name}: Provider error`,
                 content: `[${provider.name.toUpperCase()}] Provider failed: ${message}`,
                 timestamp: Date.now(),
@@ -220,7 +220,7 @@ export class ContextManager {
       }
 
       try {
-        providers.push(new Ctor(providerCfg, this.repoRoot));
+        providers.push(new Ctor(providerCfg));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.error(

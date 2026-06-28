@@ -212,6 +212,13 @@ export const LaolConfigSchema = z.object({
   agent: z.object({
     heartbeat_interval_ms: z.number().int().min(5000).default(25000),
     checkpoint_min_interval_ms: z.number().int().min(10000).default(30000),
+    mode: z.enum(["piped", "interactive"]).default("interactive"),
+    interactive: z.object({
+      terminal_timeout_seconds: z.number().int().min(60).max(86400).default(7200),
+      poll_interval_ms: z.number().int().min(1000).max(30000).default(2000),
+      session_dir: z.string().default("sessions"),
+      terminal_cmd: z.string().optional(),
+    }).optional(),
   }),
   locks: z.object({
     initial_ttl_ms: z.number().int().min(10000).default(60000),

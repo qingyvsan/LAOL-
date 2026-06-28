@@ -34,7 +34,7 @@ LAOL lets multiple Claude Code AI agents safely modify the same codebase **in pa
     │  ┌──────────────┐ │               │  ┌──────────────┐ │
     │  │ Worktree A   │ │               │  │ Worktree B   │ │
     │  │ (isolated)   │ │               │  │ (isolated)   │ │
-    │  │ claude -p ... │ │               │  │ claude -p ... │ │
+    │  │ Claude Code │ │               │  │ Claude Code │ │
     │  └──────────────┘ │               │  └──────────────┘ │
     └──────────────────┘               └──────────────────┘
               │                                   │
@@ -117,7 +117,7 @@ The index is stored at `.multiagent/codebase-index.json` and supports incrementa
 - **File system is the database** — `rename(2)` provides atomicity on NTFS (Windows) and ext4/xfs (Linux). No SQLite, no Redis.
 - **TCP localhost instead of Unix sockets** — cross-platform (Windows, Linux, macOS) with zero platform branches.
 - **Optimistic concurrency for tasks** (version numbers), **pessimistic locking for files** (exclusive leases).
-- **Claude Code CLI as subprocess** — agents spawn `claude -p` in isolated Git worktrees. LAOL manages the lifecycle; Claude does the coding.
+- **Claude Code in interactive terminals** — agents open full interactive Claude Code sessions in new terminal windows. All CLI features (MCP, hooks, skills, slash commands, plan mode) are preserved. LAOL manages task coordination, lock leases, and worktree lifecycle; Claude does the coding with full user control.
 - **Live toolchain queries, not static parsing** — context providers run real compilers, linters, and test runners instead of relying solely on AST indexing. Inspired by the fennara-godot-ai live-editor-query architecture.
 
 ## Installation
@@ -163,11 +163,15 @@ laol scheduler start
 ### 3. Start one or more agents
 
 ```bash
-# Terminal 2
+# Terminal 2 — interactive mode (default): opens a new terminal
+# window with full Claude Code CLI experience
 laol agent start --id agent-001
 
 # Terminal 3 (optional — parallel agent)
 laol agent start --id agent-002
+
+# Or use piped mode for headless/automated execution:
+laol agent start --id agent-003 --mode piped
 ```
 
 ### 4. Create a task
@@ -230,7 +234,7 @@ Initialize `.multiagent/` in the current repository.
 
 | Command | Description |
 |---------|-------------|
-| `laol agent start --id <agent-id> [--port 9123] [--host 127.0.0.1]` | Start an agent |
+| `laol agent start --id <agent-id> [--port 9123] [--host 127.0.0.1] [--mode interactive\|piped]` | Start an agent (default: interactive) |
 
 ### `laol locks`
 
@@ -295,7 +299,14 @@ Show system overview: task counts, lock count, pool usage.
   },
   "agent": {
     "heartbeat_interval_ms": 25000,
-    "checkpoint_min_interval_ms": 30000
+    "checkpoint_min_interval_ms": 30000,
+    "mode": "interactive",       // "piped" for headless, "interactive" for full CLI experience
+    "interactive": {
+      "terminal_timeout_seconds": 7200,  // Max session duration (2 hours)
+      "poll_interval_ms": 2000,          // Sentinel file poll interval
+      "session_dir": "sessions",         // Sentinel file directory
+      "terminal_cmd": null               // Custom terminal command (optional)
+    }
   },
   "locks": {
     "initial_ttl_ms": 60000,   // New lock TTL (60s)
@@ -369,8 +380,15 @@ AgentRunner.handleTaskAssigned(msg)
         ├── ContextManager.collectPreHints()   # 7 live providers: tsc, eslint, tests, git, etc.
         │   └── Inject [TYPESCRIPT], [ESLINT], [TEST BASELINE], [GIT], [SYMBOLS], etc.
         │
-        ├── ClaudeCodeExecutor.execute(worktreePath, task, hints)
-        │   └── spawn("claude", ["-p", prompt, "--output-format", "text", ...])
+        ├── AgentRunner.createInteractiveExecutor()  # Mode: interactive (default)
+        │   ├── Writes CLAUDE.md to worktree root   # Task context injected
+        │   ├── InteractiveTerminalOpener opens new terminal window
+        │   │   └── Full Claude Code CLI: MCP, hooks, skills, slash commands, plan mode
+        │   ├── Polls sentinel file for exit detection
+        │   └── User types /exit or Ctrl+D → terminal closes
+        │
+        ├── AgentRunner.createPipedExecutor()       # Mode: piped (headless)
+        │   └── spawn("claude", ["-p", prompt, ...])  # Automated execution
         │       ├── Claude reads target files
         │       ├── Claude makes edits
         │       └── Claude exits 0 → success
@@ -402,7 +420,7 @@ src/
 ├── task/            # Task JSON CRUD + chokidar watcher
 ├── lock/            # Two-phase commit locks + TTL leases + symbol resolver
 ├── scheduler/       # Event-driven scheduler + conflict checker + circuit breaker + health monitor
-├── agent/           # Agent worker + heartbeat + checkpoint + perception + Claude executor
+├── agent/           # Agent worker + heartbeat + checkpoint + interactive/piped executor + Claude executor
 ├── context/         # Context provider pipeline (7 providers: tsc, eslint, test, git, python, codebase, custom)
 │   └── providers/   # Individual provider implementations
 ├── worktree/        # Git worktree pool

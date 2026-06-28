@@ -281,18 +281,40 @@ agentCmd
   .requiredOption("--id <agent-id>", "Unique agent identifier")
   .option("--port <number>", "Scheduler port to connect to", "9123")
   .option("--host <host>", "Scheduler host", "127.0.0.1")
+  .option("--mode <mode>", "Execution mode: piped (non-interactive) or interactive (full terminal). Default: from config (interactive)")
   .action(async (options) => {
     const root = resolveRepoRoot();
     const agentId = options.id;
     const port = parseInt(options.port, 10);
     const host = options.host;
+    const mode = options.mode as string | undefined;
+
+    // Validate mode if provided
+    if (mode !== undefined && mode !== "piped" && mode !== "interactive") {
+      console.log(chalk.red(`Invalid mode: "${mode}". Must be "piped" or "interactive".`));
+      process.exit(1);
+    }
+
+    // Resolve effective mode: CLI flag > config > default ("interactive")
+    const config = loadConfig(root);
+    const effectiveMode = mode ?? config.agent.mode ?? "interactive";
+
+    const modeDisplay = effectiveMode === "interactive"
+      ? chalk.cyan("interactive (terminal)")
+      : chalk.dim("piped (background)");
 
     console.log(chalk.bold(`LAOL Agent: ${agentId}`));
     console.log(`  Repo:         ${root}`);
     console.log(`  Scheduler:    ${host}:${port}`);
+    console.log(`  Mode:         ${modeDisplay}`);
     console.log("");
 
-    const runner = new AgentRunner(root, agentId, port, host);
+    if (effectiveMode === "interactive") {
+      console.log(chalk.dim("  In interactive mode, a new terminal window will open for each task."));
+      console.log(chalk.dim("  This agent terminal shows logs and status. Keep it running.\n"));
+    }
+
+    const runner = new AgentRunner(root, agentId, port, host, effectiveMode as "piped" | "interactive");
 
     const shutdown = async () => {
       console.log(chalk.yellow("\nShutting down agent..."));

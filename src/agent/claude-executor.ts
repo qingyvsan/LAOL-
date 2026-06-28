@@ -119,6 +119,14 @@ export interface ClaudeExecutionResult {
 }
 
 /**
+ * Result of interactive context preparation.
+ */
+export interface InteractiveContext {
+  claudeMdPath: string;
+  content: string;
+}
+
+/**
  * ClaudeCodeExecutor — spawns `claude` in the agent's isolated worktree.
  *
  * The prompt is piped via stdin (not the -p flag) to avoid Windows
@@ -510,6 +518,144 @@ export class ClaudeCodeExecutor {
     }
 
     return args;
+  }
+
+  // ---- Interactive mode helpers ----
+
+  /**
+   * Write CLAUDE.md into the worktree for an interactive session.
+   * Claude Code automatically reads CLAUDE.md on startup, so the agent
+   * receives its task context without needing a piped stdin prompt.
+   *
+   * @returns Path to the written file and its content
+   */
+  prepareInteractiveContext(
+    worktreePath: string,
+    task: Task,
+    contextHints: string[],
+    readOnly = false
+  ): InteractiveContext {
+    const claudeMdPath = path.join(worktreePath, "CLAUDE.md");
+    const content = this.buildClaudeMdPrompt(worktreePath, task, contextHints, readOnly);
+    fs.writeFileSync(claudeMdPath, content, "utf-8");
+    return { claudeMdPath, content };
+  }
+
+  /**
+   * Build CLAUDE.md content for the interactive session.
+   * Similar to buildPrompt() but formatted as a permanent CLAUDE.md
+   * file instead of a one-shot stdin prompt.
+   */
+  buildClaudeMdPrompt(
+    worktreePath: string,
+    task: Task,
+    contextHints: string[],
+    readOnly = false
+  ): string {
+    const lines: string[] = [];
+
+    // Header
+    lines.push("# LAOL Agent Task");
+    lines.push("");
+
+    // Role
+    lines.push("## Role");
+    if (readOnly) {
+      lines.push(
+        "You are an AI analysis agent in the LAOL multi-agent collaboration system."
+      );
+      lines.push(
+        "This is a **READ-ONLY** task — you must NOT modify any files."
+      );
+      lines.push(
+        "Your entire response will be saved as a report and shown to the user."
+      );
+    } else {
+      lines.push(
+        "You are an AI coding agent in the LAOL multi-agent collaboration system."
+      );
+      lines.push(
+        `You are working in an isolated git worktree on branch \`agent/${task.id}\`.`
+      );
+      lines.push(
+        "Your changes will be committed and merged automatically after you finish."
+      );
+    }
+    lines.push("");
+
+    // Task description
+    lines.push("## Task");
+    lines.push(task.description);
+    lines.push("");
+
+    // Target files
+    if (task.target_files.length > 0) {
+      lines.push(readOnly ? "## Target Files (for analysis)" : "## Target Files");
+      if (!readOnly) lines.push("Focus your changes on these files:");
+      for (const f of task.target_files) {
+        lines.push(`- \`${f}\``);
+      }
+      lines.push("");
+    } else {
+      lines.push("## Exploration First");
+      lines.push(
+        "No target files were pre-specified. You must first explore the"
+      );
+      lines.push(
+        "codebase to determine which files need to be modified, then proceed"
+      );
+      lines.push("with the implementation.");
+      lines.push("");
+    }
+
+    // Context hints
+    if (contextHints.length > 0) {
+      lines.push("## Context & Warnings");
+      for (const hint of contextHints) {
+        lines.push(`- ${hint}`);
+      }
+      lines.push("");
+    }
+
+    // Instructions
+    lines.push("## Instructions");
+    if (readOnly) {
+      lines.push("1. Read and explore the relevant files to understand the code");
+      lines.push("2. Analyze based on the task description");
+      lines.push("3. Report your findings clearly and comprehensively as markdown");
+      lines.push("4. **Do NOT modify any files** — this is a read-only analysis");
+      lines.push("5. When you are done, type `/exit` or press Ctrl+D to finish");
+    } else {
+      lines.push("1. Read the target files to understand the current code");
+      lines.push("2. Implement the changes described in the Task section");
+      lines.push("3. Verify your changes compile and are correct — run build and tests");
+      lines.push("4. Keep changes minimal and focused — only modify what the task requires");
+      lines.push("5. When you are done, type `/exit` or press Ctrl+D to finish");
+    }
+    lines.push("");
+
+    // Test/build hints
+    if (!readOnly) {
+      const pkgJsonPath = path.join(worktreePath, "package.json");
+      if (fs.existsSync(pkgJsonPath)) {
+        try {
+          const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
+          if (pkg.scripts?.test || pkg.scripts?.build) {
+            lines.push("## Available Commands");
+            lines.push("```");
+            if (pkg.scripts.test) lines.push(`npm test      — ${pkg.scripts.test}`);
+            if (pkg.scripts.build) lines.push(`npm run build — ${pkg.scripts.build}`);
+            if (pkg.scripts.lint) lines.push(`npm run lint  — ${pkg.scripts.lint}`);
+            lines.push("```");
+            lines.push("");
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    return lines.join("\n");
   }
 
   // ---- Helpers ----

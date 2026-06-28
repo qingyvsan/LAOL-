@@ -340,6 +340,30 @@ export interface LiveContextState {
   payload: unknown;
 }
 
+/**
+ * Configuration for interactive terminal mode.
+ * Agents open a new terminal window with full Claude Code experience.
+ */
+export interface InteractiveAgentConfig {
+  /** Max time to wait for the interactive session before marking stuck (seconds). */
+  terminal_timeout_seconds: number;
+  /** Interval for polling sentinel file removal (ms). */
+  poll_interval_ms: number;
+  /** Directory under .multiagent/ for session state files. */
+  session_dir: string;
+  /** Optional custom terminal command override. */
+  terminal_cmd?: string;
+}
+
+/**
+ * Result of an interactive terminal session.
+ */
+export interface InteractiveResult {
+  exitCode: number | null;
+  sentinelRemoved: boolean;
+  durationMs: number;
+}
+
 export interface LaolConfig {
   scheduler: {
     port: number;
@@ -362,6 +386,10 @@ export interface LaolConfig {
   agent: {
     heartbeat_interval_ms: number;
     checkpoint_min_interval_ms: number;
+    /** Execution mode: "piped" (stdin, non-interactive) or "interactive" (new terminal window). */
+    mode: "piped" | "interactive";
+    /** Configuration for interactive terminal mode. */
+    interactive?: InteractiveAgentConfig;
   };
   locks: {
     initial_ttl_ms: number;
