@@ -284,6 +284,45 @@ describe("SocketClient", () => {
     const result = server.pingAgent("nonexistent");
     expect(result).toBe(false);
   });
+
+  it("handles change_query and returns change_result", async () => {
+    const client = new SocketClient("agent-query", port);
+
+    // Set up server-side handler for change_query
+    server.on("change_query", (agentId: string, reqId: string, qtype: string, files?: string[], since?: number) => {
+      server.sendChangeResult(agentId, reqId, [
+        { id: "change-1", type: "file", timestamp: Date.now(), file: "src/a.ts", agent_id: "agent-002" },
+      ]);
+    });
+
+    await client.connect();
+    await new Promise((r) => setTimeout(r, 50));
+
+    const results = await client.queryChanges({ files: ["src/a.ts"] });
+    expect(results).toHaveLength(1);
+    expect((results as Record<string, unknown>[])[0].type).toBe("file");
+
+    client.disconnect();
+  });
+
+  it("handles change_query with qtype filter", async () => {
+    const client = new SocketClient("agent-query-type", port);
+
+    server.on("change_query", (agentId: string, reqId: string) => {
+      server.sendChangeResult(agentId, reqId, [
+        { id: "k1", type: "knowledge", timestamp: Date.now(), task_id: "t1", agent_id: "agent-001", summary: "test" },
+      ]);
+    });
+
+    await client.connect();
+    await new Promise((r) => setTimeout(r, 50));
+
+    const results = await client.queryChanges({ qtype: "knowledge" });
+    expect(results).toHaveLength(1);
+    expect((results as Record<string, unknown>[])[0].type).toBe("knowledge");
+
+    client.disconnect();
+  });
 });
 
 /**

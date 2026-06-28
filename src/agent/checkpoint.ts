@@ -31,6 +31,12 @@ export class Checkpoint {
     this.taskId = taskId;
     this.baseBranch = baseBranch;
     this.minFetchIntervalMs = minFetchIntervalMs;
+
+    // Start with a "just fetched" timestamp so the first checkAndRebase()
+    // call is deferred. Fresh worktrees are already at the latest commit;
+    // the pre-commit rebase will catch any upstream changes that land
+    // during the session. This avoids a redundant git fetch on session start.
+    this.lastFetchTime = Date.now();
   }
 
   /**

@@ -277,16 +277,18 @@ const agentCmd = program
 
 agentCmd
   .command("start")
-  .description("Start an agent (long-running process)")
-  .requiredOption("--id <agent-id>", "Unique agent identifier")
-  .option("--port <number>", "Scheduler port to connect to", "9123")
-  .option("--host <host>", "Scheduler host", "127.0.0.1")
-  .option("--mode <mode>", "Execution mode: piped (non-interactive) or interactive (full terminal). Default: from config (interactive)")
+  .description("Start an agent and open Claude Code for interactive work")
+  .option("--id <agent-id>", "Agent identifier (auto-generated if not provided)")
+  .option("--scheduled", "Connect to scheduler for task dispatch (opt-in, off by default)")
+  .option("--port <number>", "Scheduler port (only with --scheduled)", "9123")
+  .option("--host <host>", "Scheduler host (only with --scheduled)", "127.0.0.1")
+  .option("--mode <mode>", "Execution mode: piped or interactive (default: interactive)")
+  .option("--coordinate <port>", "Connect to scheduler for lock/file coordination (optional)")
+  .option("--description <text>", "Session description (optional)")
+  .option("--files <paths...>", "Target file paths (optional)")
   .action(async (options) => {
     const root = resolveRepoRoot();
-    const agentId = options.id;
-    const port = parseInt(options.port, 10);
-    const host = options.host;
+    const isScheduled = options.scheduled === true;
     const mode = options.mode as string | undefined;
 
     // Validate mode if provided
@@ -295,9 +297,96 @@ agentCmd
       process.exit(1);
     }
 
-    // Resolve effective mode: CLI flag > config > default ("interactive")
     const config = loadConfig(root);
     const effectiveMode = mode ?? config.agent.mode ?? "interactive";
+
+    // ---- Default: standalone mode (immediate Claude Code) ----
+    if (!isScheduled) {
+      // Validate target files if provided
+      const targetFiles: string[] = options.files ?? [];
+      if (targetFiles.length > 0) {
+        try {
+          TaskStore.validateTargetFiles(targetFiles);
+        } catch (err) {
+          console.log(chalk.red((err as Error).message));
+          process.exit(1);
+        }
+      }
+
+      const agentId = options.id ?? `agent-${Date.now().toString(36)}`;
+
+      const modeDisplay = effectiveMode === "interactive"
+        ? chalk.cyan("interactive (terminal)")
+        : chalk.dim("piped (background)");
+
+      console.log(chalk.bold(`LAOL Agent: ${agentId}`));
+      console.log(`  Repo:         ${root}`);
+      console.log(`  Mode:         ${modeDisplay}`);
+      if (options.description) {
+        console.log(`  Description:  ${options.description}`);
+      }
+      if (targetFiles.length > 0) {
+        console.log(`  Files:        ${targetFiles.join(", ")}`);
+      }
+      console.log("");
+
+      if (effectiveMode === "interactive") {
+        console.log(chalk.dim("  A new terminal window will open with Claude Code."));
+        console.log(chalk.dim("  Work conversationally. Type /exit when done.\n"));
+      }
+
+      const coordinatePort = options.coordinate ? parseInt(options.coordinate, 10) : undefined;
+
+      if (coordinatePort && (isNaN(coordinatePort) || coordinatePort < 1 || coordinatePort > 65535)) {
+        console.log(chalk.red(`Invalid coordinate port: ${options.coordinate}`));
+        process.exit(1);
+      }
+
+      if (coordinatePort) {
+        console.log(`  Coordinate:   127.0.0.1:${coordinatePort}`);
+      }
+
+      const runner = new AgentRunner(
+        root,
+        agentId,
+        0,
+        "",
+        effectiveMode as "piped" | "interactive",
+        {
+          standalone: true,
+          description: options.description,
+          targetFiles,
+          coordinatePort,
+        }
+      );
+
+      const shutdown = async () => {
+        console.log(chalk.yellow("\nShutting down..."));
+        await runner.stop();
+        process.exit(0);
+      };
+
+      process.on("SIGINT", shutdown);
+      process.on("SIGTERM", shutdown);
+
+      try {
+        await runner.start();
+      } catch (err) {
+        console.error(chalk.red(`Failed to start agent: ${err}`));
+        process.exit(1);
+      }
+      return;
+    }
+
+    // ---- Scheduled mode (connect to scheduler) ----
+    if (!options.id) {
+      console.log(chalk.red("Agent --id is required with --scheduled"));
+      process.exit(1);
+    }
+
+    const agentId = options.id;
+    const port = parseInt(options.port, 10);
+    const host = options.host;
 
     const modeDisplay = effectiveMode === "interactive"
       ? chalk.cyan("interactive (terminal)")

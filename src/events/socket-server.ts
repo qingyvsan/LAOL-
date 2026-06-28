@@ -7,9 +7,11 @@ import { EventEmitter } from "node:events";
  * Agent → Server:
  *   {"type":"register","agent_id":"agent-001"}
  *   {"type":"heartbeat","agent_id":"agent-001","locks":["src/auth.ts"]}
- *   {"type":"task_done","agent_id":"agent-001","task_id":"uuid"}
+ *   {"type":"task_done","agent_id":"agent-001","task_id":"uuid","summary":"..."}
  *   {"type":"task_failed","agent_id":"agent-001","task_id":"uuid","reason":"..."}
  *   {"type":"lock_request","agent_id":"agent-001","task_id":"uuid","files":["src/x.ts"]}
+ *   {"type":"file_modified","agent_id":"agent-001","files":["src/auth.ts"],"worktree":"/path/to/wt"}
+ *   {"type":"change_query","agent_id":"agent-001","req_id":"uuid","qtype":"file","files":["src/x.ts"],"since":1719600000}
  *
  * Server → Agent:
  *   {"type":"ping"}
@@ -21,6 +23,9 @@ import { EventEmitter } from "node:events";
  *   {"type":"lock_waiting","task_id":"uuid","files":["src/x.ts"],"reason":"Waiting for lock held by agent-002"}
  *   {"type":"lock_granted","task_id":"uuid","files":["src/x.ts"]}
  *   {"type":"lock_denied","task_id":"uuid","files":["src/x.ts"],"reason":"Deadlock detected"}
+ *   {"type":"file_propagate","file":"src/auth.ts","source_worktree":"/path/to/wt1","source_agent":"agent-001"}
+ *   {"type":"knowledge_updated","task_id":"uuid","agent_id":"agent-001","summary":"Refactored auth module"}
+ *   {"type":"change_result","req_id":"uuid","changes":[{...}]}
  */
 
 export interface SocketMessage {
@@ -174,6 +179,30 @@ export class SocketServer extends EventEmitter {
   }
 
   /**
+   * Tell an agent to propagate a file from another agent's worktree.
+   * Used when a file was modified by one agent and another agent needs the latest version.
+   */
+  sendFilePropagate(agentId: string, file: string, sourceWorktree: string, sourceAgent: string): boolean {
+    return this.sendToAgent(agentId, {
+      type: "file_propagate",
+      file,
+      source_worktree: sourceWorktree,
+      source_agent: sourceAgent,
+    });
+  }
+
+  /**
+   * Send change journal query results back to a specific agent.
+   */
+  sendChangeResult(agentId: string, reqId: string, changes: unknown[]): boolean {
+    return this.sendToAgent(agentId, {
+      type: "change_result",
+      req_id: reqId,
+      changes,
+    });
+  }
+
+  /**
    * Push a lock_released event only to agents whose current task
    * involves the released file (targeted push, not broadcast).
    */
@@ -282,8 +311,9 @@ export class SocketServer extends EventEmitter {
       case "task_done": {
         const agentId = msg.agent_id as string;
         const taskId = msg.task_id as string;
+        const summary = msg.summary as string | undefined;
         if (!agentId || !taskId) return;
-        this.emit("task_completed", agentId, taskId);
+        this.emit("task_completed", agentId, taskId, summary);
         break;
       }
 
@@ -300,8 +330,29 @@ export class SocketServer extends EventEmitter {
         const agentId = msg.agent_id as string;
         const taskId = msg.task_id as string;
         const files = msg.files as string[] ?? [];
+        const skipPropagation = msg.skip_propagation as boolean ?? false;
         if (!agentId || !taskId || files.length === 0) return;
-        this.emit("lock_request", agentId, taskId, files);
+        this.emit("lock_request", agentId, taskId, files, skipPropagation);
+        break;
+      }
+
+      case "file_modified": {
+        const agentId = msg.agent_id as string;
+        const files = msg.files as string[] ?? [];
+        const worktree = msg.worktree as string ?? "";
+        if (!agentId || files.length === 0) return;
+        this.emit("file_modified", agentId, files, worktree);
+        break;
+      }
+
+      case "change_query": {
+        const agentId = msg.agent_id as string;
+        const reqId = msg.req_id as string;
+        const qtype = (msg.qtype as string) ?? "all";
+        const files = msg.files as string[] | undefined;
+        const since = msg.since as number | undefined;
+        if (!agentId || !reqId) return;
+        this.emit("change_query", agentId, reqId, qtype, files, since);
         break;
       }
 

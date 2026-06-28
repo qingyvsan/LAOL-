@@ -40,7 +40,7 @@ export class AgentRunner {
   private config: LaolConfig;
   private mode: "piped" | "interactive";
 
-  private socketClient: SocketClient;
+  private socketClient: SocketClient | null = null;
   private taskStore: TaskStore;
   private lockManager: LockManager;
   private leaseManager: LeaseManager;
@@ -54,7 +54,19 @@ export class AgentRunner {
   private currentTask: Task | null = null;
   private agentWorker: AgentWorker | null = null;
 
-  constructor(repoRoot: string, agentId: string, port: number, host = "127.0.0.1", mode?: "piped" | "interactive") {
+  // Standalone mode
+  private standalone: boolean;
+  private standaloneDescription: string | null;
+  private standaloneTargetFiles: string[];
+  private coordinatePort?: number;
+  private coordinationClient: SocketClient | null = null;
+
+  constructor(repoRoot: string, agentId: string, port: number, host = "127.0.0.1", mode?: "piped" | "interactive", standaloneOpts?: {
+    standalone?: boolean;
+    description?: string;
+    targetFiles?: string[];
+    coordinatePort?: number;
+  }) {
     this.repoRoot = repoRoot;
     this.agentId = agentId;
     this.port = port;
@@ -62,15 +74,32 @@ export class AgentRunner {
     this.config = loadConfig(repoRoot);
     this.mode = mode ?? this.config.agent.mode ?? "piped";
 
+    this.standalone = standaloneOpts?.standalone ?? false;
+    this.standaloneDescription = standaloneOpts?.description ?? null;
+    this.standaloneTargetFiles = standaloneOpts?.targetFiles ?? [];
+    this.coordinatePort = standaloneOpts?.coordinatePort;
+
+    // In standalone mode with --coordinate, create a coordination client
+    if (this.standalone && this.coordinatePort) {
+      this.coordinationClient = new SocketClient(agentId, this.coordinatePort, "127.0.0.1");
+    }
+
     // Initialize dependencies
     this.taskStore = new TaskStore(repoRoot);
     this.lockManager = new LockManager(repoRoot);
     this.leaseManager = new LeaseManager(this.lockManager);
-    this.worktreePool = new WorktreePool(repoRoot, this.config.agent.worktree_pool_size ?? this.config.scheduler.pool_size);
+    this.worktreePool = new WorktreePool(
+      repoRoot,
+      this.standalone ? 1 : (this.config.agent.worktree_pool_size ?? this.config.scheduler.pool_size)
+    );
     this.registryManager = new RegistryManager(repoRoot);
     this.knowledgeStore = new KnowledgeStore(repoRoot);
     this.claudeExecutor = new ClaudeCodeExecutor(this.config.claude_executor);
-    this.socketClient = new SocketClient(agentId, port, host);
+
+    // Only connect to scheduler in non-standalone mode
+    if (!this.standalone) {
+      this.socketClient = new SocketClient(agentId, port, host);
+    }
 
     if (this.mode === "interactive") {
       this.interactiveOpener = new InteractiveTerminalOpener(
@@ -85,21 +114,30 @@ export class AgentRunner {
   async start(): Promise<void> {
     this.running = true;
 
+    // Standalone mode (default): execute session immediately, skip scheduler
+    if (this.standalone) {
+      await this.executeSession();
+      return;
+    }
+
+    // In non-standalone mode, socketClient is guaranteed non-null
+    const sc = this.socketClient!;
+
     // Initialize worktree pool
     this.worktreePool.initialize();
 
     // Wire up socket events
-    this.socketClient.on("connected", () => {
+    sc.on("connected", () => {
       console.log(`[runner] Connected to scheduler at ${this.host}:${this.port}`);
     });
 
-    this.socketClient.on("disconnected", () => {
+    sc.on("disconnected", () => {
       if (this.running) {
         console.log("[runner] Disconnected from scheduler — reconnecting...");
       }
     });
 
-    this.socketClient.on("task_assigned", async (msg: SocketMessage) => {
+    sc.on("task_assigned", async (msg: SocketMessage) => {
       // Guard: if already handling a task, reject the assignment.
       // The scheduler tracks agent busy state and should not send this,
       // but reconnection edge cases can trigger it.
@@ -112,7 +150,7 @@ export class AgentRunner {
       await this.handleTaskAssigned(msg);
     });
 
-    this.socketClient.on("task_resume", async (msg: SocketMessage) => {
+    sc.on("task_resume", async (msg: SocketMessage) => {
       // Guard: if already handling a task (e.g. in the middle of an
       // interactive session), don't start another. The scheduler will
       // resend task_resume after the next heartbeat if the task is
@@ -126,41 +164,41 @@ export class AgentRunner {
       await this.handleTaskAssigned(msg);
     });
 
-    this.socketClient.on("lock_released", (msg: SocketMessage) => {
+    sc.on("lock_released", (msg: SocketMessage) => {
       const file = msg.file as string;
       if (file) {
         console.log(`[runner] Lock released: ${file}`);
       }
     });
 
-    this.socketClient.on("ping", () => {
+    sc.on("ping", () => {
       // Respond to scheduler's ping by sending a heartbeat
-      this.socketClient.sendHeartbeat(
+      sc.sendHeartbeat(
         this.lockManager.listLocks({ holder: this.agentId }).map((l) => l.file)
       );
     });
 
-    this.socketClient.on("merge_completed", (msg: SocketMessage) => {
+    sc.on("merge_completed", (msg: SocketMessage) => {
       console.log(`[runner] Merge completed for task ${msg.task_id}`);
     });
 
-    this.socketClient.on("lock_granted", (msg: SocketMessage) => {
+    sc.on("lock_granted", (msg: SocketMessage) => {
       const files = msg.files as string[] ?? [];
       console.log(`[runner] Locks granted: ${files.join(", ")}`);
     });
 
-    this.socketClient.on("lock_denied", (msg: SocketMessage) => {
+    sc.on("lock_denied", (msg: SocketMessage) => {
       const files = msg.files as string[] ?? [];
       const reason = msg.reason as string ?? "unknown";
       console.log(`[runner] Locks denied for ${files.join(", ")}: ${reason}`);
     });
 
-    this.socketClient.on("shutdown", () => {
+    sc.on("shutdown", () => {
       this.handleShutdown();
     });
 
     // Connect to scheduler
-    await this.socketClient.connect();
+    await sc.connect();
   }
 
   /**
@@ -168,7 +206,12 @@ export class AgentRunner {
    */
   async stop(): Promise<void> {
     this.running = false;
-    this.socketClient.disconnect();
+    if (this.socketClient) {
+      this.socketClient.disconnect();
+    }
+    if (this.coordinationClient) {
+      this.coordinationClient.disconnect();
+    }
 
     // Release any locks still held
     this.lockManager.releaseAllForAgent(this.agentId);
@@ -180,6 +223,11 @@ export class AgentRunner {
         assigned_agent: null,
         metadata: { agent_stopped_at: Date.now() },
       }));
+    }
+
+    // In standalone mode, clean up worktree pool
+    if (this.standalone) {
+      this.worktreePool.shutdown();
     }
   }
 
@@ -208,10 +256,134 @@ export class AgentRunner {
     this.worktreePool.shutdown();
 
     // Disconnect from scheduler
-    this.socketClient.disconnect();
+    this.socketClient?.disconnect();
 
     console.log(`[runner] Agent "${this.agentId}" shut down.`);
     process.exit(0);
+  }
+
+  // ---- Session (standalone) ----
+
+  /**
+   * Execute a standalone session — no scheduler, persistent Claude Code.
+   *
+   * 1. Creates a minimal session task (persisted as a log record)
+   * 2. Initializes worktree pool and acquires a worktree
+   * 3. Opens Claude Code (interactive terminal or piped)
+   * 4. After exit: commits changes, cleans up, exits process
+   */
+  private async executeSession(): Promise<void> {
+    const description = this.standaloneDescription ?? "Interactive session";
+
+    // 1. Create a minimal session task (log record, not a work assignment)
+    const task = this.taskStore.createTask({
+      description,
+      target_files: this.standaloneTargetFiles,
+    });
+
+    this.taskStore.updateTask(task.id, () => ({
+      status: "in_progress",
+      assigned_agent: this.agentId,
+    }));
+
+    const currentTask = this.taskStore.getTask(task.id)!;
+
+    console.log(chalk.bold(`\nLAOL Agent: ${this.agentId}`));
+    console.log(`  Session:      ${currentTask.id.slice(0, 8)}`);
+    console.log(`  Repo:         ${this.repoRoot}`);
+    console.log(`  Mode:         ${this.mode}`);
+    if (this.standaloneDescription) {
+      console.log(`  Description:  ${currentTask.description}`);
+    }
+    console.log("");
+
+    if (this.mode === "interactive") {
+      console.log(chalk.dim("  A new terminal window will open with Claude Code."));
+      console.log(chalk.dim("  Work conversationally. Type /exit when done.\n"));
+    }
+
+    // 2. Initialize worktree pool (single worktree for session)
+    this.worktreePool.initialize();
+
+    // 2b. Connect to scheduler for lock/file coordination (if --coordinate)
+    if (this.coordinationClient) {
+      try {
+        await this.coordinationClient.connect();
+        console.log(chalk.dim(`  Coordinating via scheduler at port ${this.coordinatePort}`));
+      } catch (err) {
+        console.warn(chalk.yellow(`  Warning: Could not connect to scheduler for coordination: ${err}`));
+        this.coordinationClient = null;
+      }
+    }
+
+    // 3. Build knowledge context (if available)
+    const knowledgeHints = this.knowledgeStore.findRelevant(
+      currentTask.target_files,
+      currentTask.description,
+      3
+    );
+    const knowledgeContext = knowledgeHints.length > 0
+      ? this.knowledgeStore.formatContext(knowledgeHints)
+      : null;
+
+    // 4. Create AgentWorker with coordinationClient (if coordinating) or null
+    let discoveryOutput = "";
+    this.agentWorker = new AgentWorker(
+      this.repoRoot,
+      this.agentId,
+      this.taskStore,
+      this.lockManager,
+      this.leaseManager,
+      this.worktreePool,
+      this.coordinationClient, // socketClient — for lock/file coordination
+      this.registryManager,
+      this.knowledgeStore
+    );
+
+    this.currentTask = currentTask;
+
+    try {
+      await this.agentWorker.executeTask(
+        currentTask,
+        this.mode === "interactive"
+          ? this.createInteractiveExecutor(knowledgeContext)
+          : this.createPipedExecutor(knowledgeContext),
+        this.createPipedDiscoveryExecutor(
+          (output) => { discoveryOutput = output; }
+        )
+      );
+
+      // Save discovery output as knowledge
+      if (discoveryOutput) {
+        const updatedTask = this.taskStore.getTask(currentTask.id);
+        if (updatedTask && (updatedTask.target_files.length === 0 || updatedTask.metadata?.read_only)) {
+          this.knowledgeStore.save({
+            task_id: currentTask.id,
+            agent_id: this.agentId,
+            description: currentTask.description,
+            summary: discoveryOutput.slice(0, 500),
+            files: [],
+            created_at: Date.now(),
+          });
+        }
+      }
+
+      console.log(chalk.green(`\nSession completed.`));
+      console.log(chalk.dim(`Session ID: ${currentTask.id.slice(0, 8)}`));
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(chalk.red(`\nSession failed: ${reason}`));
+    } finally {
+      // Disconnect coordination client
+      if (this.coordinationClient) {
+        this.coordinationClient.disconnect();
+      }
+
+      this.currentTask = null;
+      this.agentWorker = null;
+      this.worktreePool.shutdown();
+      process.exit(0);
+    }
   }
 
   // ---- Task handling ----
@@ -366,7 +538,12 @@ export class AgentRunner {
         console.log(chalk.green(`[claude] Task completed successfully`));
       }
 
-      return { stdout: result.stdout };
+      return {
+        stdout: result.stdout,
+        summary: isReadOnly
+          ? `Analyzed: ${_task.description.slice(0, 200)}`
+          : result.stdout.slice(0, 500) || _task.description,
+      };
     };
   }
 
@@ -432,11 +609,12 @@ export class AgentRunner {
 
       // Save knowledge for future agents
       if (!isReadOnly) {
+        const knowledgeSummary = `Completed in ${(result.durationMs / 1000).toFixed(1)}s: ${_task.description.slice(0, 300)}`;
         this.knowledgeStore.save({
           task_id: _task.id,
           agent_id: this.agentId,
           description: _task.description,
-          summary: `Interactive session completed in ${(result.durationMs / 1000).toFixed(1)}s`,
+          summary: knowledgeSummary,
           files: _task.target_files,
           created_at: Date.now(),
         });
@@ -448,7 +626,13 @@ export class AgentRunner {
         console.log(chalk.green(`[interactive] Task session completed`));
       }
 
-      return { stdout: `Interactive session completed in ${(result.durationMs / 1000).toFixed(1)}s` };
+      const duration = `${(result.durationMs / 1000).toFixed(1)}s`;
+      return {
+        stdout: `Interactive session completed in ${duration}`,
+        summary: isReadOnly
+          ? `Analyzed: ${_task.description.slice(0, 200)}`
+          : `Completed in ${duration}: ${_task.description.slice(0, 300)}`,
+      };
     };
   }
 

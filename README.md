@@ -14,6 +14,7 @@ LAOL lets multiple Claude Code AI agents safely modify the same codebase **in pa
                            │   ├── staging/            │  ← Two-phase commit
                            │   ├── wal/                │  ← Crash recovery log
                            │   ├── knowledge/          │  ← Shared agent memory
+                           │   ├── journal/            │  ← Change log + cache
                            │   ├── cache/tsc/          │  ← TSC result cache
                            │   ├── reports/            │  ← Read-only task reports
                            │   ├── sessions/           │  ← Interactive session state
@@ -26,6 +27,7 @@ LAOL lets multiple Claude Code AI agents safely modify the same codebase **in pa
                     │  │ Conflict Checker      │ │
                     │  │ Circuit Breaker       │ │
                     │  │ Health Monitor        │ │
+                    │  │ ChangeJournal         │ │
                     │  │ Event Bus             │ │
                     │  └───────────────────────┘ │
                     └──────┬─────────┬───────────┘
@@ -66,7 +68,7 @@ LAOL lets multiple Claude Code AI agents safely modify the same codebase **in pa
 
 ## Context Provider System
 
-LAOL features a **live context injection pipeline** that runs real toolchains before and after each agent task, injecting structured diagnostics directly into the agent prompt. This eliminates the need for agents to waste tokens running `tsc`, `eslint`, or `git blame` themselves — the results are pre-computed.
+LAOL features a **live context injection pipeline** that runs real toolchains before and after each agent task. This eliminates the need for agents to waste tokens running `tsc`, `eslint`, or `git blame` themselves — the results are pre-computed.
 
 **7 built-in providers** run in parallel with individual error isolation:
 
@@ -80,9 +82,41 @@ LAOL features a **live context injection pipeline** that runs real toolchains be
 | **CodebaseProvider** | Queries the symbol index for target file structure (functions, classes, exports) |
 | **CustomProvider** | Executes user-defined pre/post commands from config |
 
+### Language Support
+
+The context provider system is language-aware. Full coverage varies by language:
+
+| Language | Type Check | Lint | Test | Symbols | Git | Custom | Coverage |
+|----------|------------|------|------|---------|-----|--------|----------|
+| **TypeScript/JS** | tsc | eslint | vitest/jest | TS AST | Yes | Yes | 7/7 providers |
+| **Python** | mypy | ruff | pytest | Python AST | Yes | Yes | 5/7 providers |
+| **Other** (Go, Rust, Java, etc.) | — | — | — | — | Yes | Yes | 2/7 providers |
+
+**TypeScript/JavaScript** projects get the full pipeline: type-checking (tsc), linting (eslint), test running (vitest/jest), symbol indexing (TS compiler API), and git diagnostics — all with tree-hash caching to avoid redundant runs across agents.
+
+**Python** projects have solid diagnostics coverage (ruff + mypy, both tree-hash cached) and test support (pytest with test-file inference), but lack a dedicated ESLint equivalent. Ruff covers most lint rules so this gap is narrow in practice. Symbol indexing supports Python AST extraction with Sphinx/Google docstring parsing.
+
+**Other languages** can only use `GitProvider` (works with any git repo) and `CustomProvider` (user-defined pre/post commands). To add diagnostics for a new language, configure `custom` in `context_providers` with shell commands that output errors in a grep-friendly format.
+
+**Smart hint routing:** Critical diagnostics (type errors, lint violations, test results) are injected directly into the agent prompt. Lower-priority context (git blame, codebase symbols) is written to `.multiagent/diagnostics.md` — available on demand without consuming prompt tokens. This saves ~350 tokens per task.
+
+**Cross-provider deduplication:** When TypeScript and ESLint report the same code issue, the duplicate is automatically filtered out (>60% content overlap detection), preventing redundant context from wasting tokens.
+
 After the task, providers with `deactivate()` re-run to compute **before/after deltas** (errors fixed, new failures introduced), stored in the KnowledgeStore for other agents.
 
 **Token impact:** Pre-computed diagnostics reduce agent-initiated tool calls by an estimated **55-65%** — from ~2,500-8,700 tokens down to ~1,000-3,100 per task.
+
+## Change Journal (Pull-Based Change Tracking)
+
+Instead of broadcasting every file modification to all agents (creating noise for agents working on unrelated files), LAOL uses a **pull-based ChangeJournal**. Agents query for changes relevant to their specific target files on demand.
+
+| Component | Purpose |
+|-----------|---------|
+| **ChangeJournal** (scheduler) | Records file changes, index updates, and merge completions to an append-only NDJSON log at `.multiagent/journal/change-log.ndjson`. Memory-capped at 10,000 entries. |
+| **ChangeJournalClient** (agent) | Queries the journal via `change_query` socket message at task start, filters to entries matching the agent's target files, and writes a local cache at `.multiagent/journal/latest-changes.md`. |
+| **Knowledge push** (targeted) | Knowledge updates are pushed only to busy agents (those actively executing a task), not broadcast to idle ones. Agents write received knowledge to `.multiagent/notifications.md`. |
+
+**Result:** Agents only see changes that matter to them. File change noise is eliminated; knowledge sharing is preserved.
 
 ## Knowledge Sharing
 
@@ -94,7 +128,7 @@ Before starting work, each agent queries the knowledge store for:
 - **Relevant discoveries** — Have other agents already explored files in the same module?
 - **Provider deltas** — What lint/type errors did the previous agent fix or introduce?
 
-This prevents agents from re-exploring the same code or repeating known mistakes. The store uses the file system directly — one JSON file per task — with O(1) lookups by task ID.
+This prevents agents from re-exploring the same code or repeating known mistakes. The store uses the file system directly — one JSON file per task — with O(1) lookups by task ID. An in-memory cache (5-minute TTL) with in-place updates avoids re-reading files on every query.
 
 ## Codebase Indexer
 
@@ -107,7 +141,7 @@ LAOL includes a built-in **symbol-level codebase indexer** that extracts and ind
 
 The index powers two key workflows:
 
-- **Agent task localization** — Before executing a task, the `CodebaseProvider` queries the index for symbols in target files and injects `[CODEBASE SYMBOLS]` context hints. This helps the LLM understand the codebase structure without reading every file.
+- **Agent task localization** — Before executing a task, the `CodebaseProvider` queries the index for symbols in target files and writes `[CODEBASE SYMBOLS]` context to `.multiagent/diagnostics.md`. This helps the LLM understand the codebase structure without reading every file.
 - **API documentation** — Generate comprehensive API docs from JSDoc annotations with a single command.
 
 The index is stored at `.multiagent/codebase-index.json` and supports incremental updates. When `auto_index` is enabled (default), modified files are **automatically re-indexed** after each successful agent commit — keeping the index fresh without manual intervention.
@@ -129,31 +163,37 @@ LAOL includes several optimizations to avoid redundant computation across agents
 
 | Optimization | What it does |
 |-------------|-------------|
+| **Pull-based ChangeJournal** | Agents query changes for their target files on demand instead of receiving broadcasts for every file modification. Eliminates irrelevant "file changed" noise for agents working on unrelated files. |
+| **Hint priority routing** | Critical diagnostics (tsc, eslint, test) go inline to the prompt. Git and codebase context is written to `.multiagent/diagnostics.md` for on-demand reading, saving ~350 tokens per task. |
+| **Cross-provider deduplication** | Overlapping diagnostics from different providers (e.g., same error reported by both tsc and eslint) are detected and filtered by content overlap analysis (>60% threshold). |
 | **TSC result cache** | Full-project `tsc --noEmit` results are cached by git tree hash. Two agents working from the same base commit share one tsc run instead of each running it independently. Cache stored at `.multiagent/cache/tsc/`. |
 | **Incremental test re-run** | Post-task, only previously failing test files are re-run — not the full test suite. If all tests passed before, no re-run is needed. |
 | **Per-provider post-task control** | Each context provider supports `post_task_enabled: false` to skip expensive post-task re-runs. Default: test provider skips post-task (the most expensive re-run). |
-| **Per-agent worktree pool** | Each agent defaults to 1 worktree (`agent.worktree_pool_size: 1`) instead of sharing the scheduler's pool size, reducing initialization overhead. |
+| **Targeted knowledge push** | Knowledge updates are sent only to busy agents (those with an active task), not broadcast to all connected agents. |
+| **TaskWatcher deduplication** | Tracks already-emitted task IDs to avoid redundant conflict checks from chokidar re-fires or poll timer overlap. |
+| **KnowledgeStore in-place cache** | Cache entries are updated in-place on save instead of being invalidated, avoiding full directory re-reads. |
 
 ## How It Prevents Conflicts
 
 | Mechanism | What it does |
 |-----------|-------------|
-| **Two-Phase Commit Lock** | All target files locked atomically via `staging/` -> `locks/` rename. If any file is taken, the entire batch rolls back — no partial lock sets. |
+| **Two-Phase Commit Lock** | All target files locked atomically via `staging/` → `locks/` rename. If any file is taken, the entire batch rolls back — no partial lock sets. |
 | **Dynamic Lock Expansion** | Agents request locks on-demand during execution via TCP. Discovered a new dependency mid-task? Request a lock — granted or denied in real time. |
 | **Conflict Pre-Check** | Before assigning a task, the scheduler checks whether any target file is already locked. Blocked tasks stay `pending`. |
 | **Auto-Discovery** | No `--files`? No problem. Agents explore the codebase, identify target files, request locks, then proceed — all automatically. |
 | **Graded TTL Leases** | New locks: 60s TTL. After 2 successful renewals: 180s TTL. If an agent crashes, locks auto-expire within 90s (not 300s). |
-| **Context Provider Pipeline** | Before each task, 7 live providers (tsc, eslint, vitest, git, etc.) inject diagnostics into the agent prompt. After the task, providers compute deltas so the next agent knows what changed. |
-| **Agent Circuit Breaker** | 2 consecutive failures -> degraded (simple tasks only). 5 -> quarantined (no tasks). Prevents broken agents from burning API costs. |
-| **Task Dependency Chains** | When Task B depends on Task A, B's worktree starts from A's branch — inheriting all code changes. Agents receive `[PREDECESSOR]` context hints describing what A did. Chain of any length: A -> B -> C works naturally. |
+| **Context Provider Pipeline** | Before each task, 7 live providers (tsc, eslint, vitest, git, etc.) run diagnostics. Critical results go inline to the prompt; full results go to `.multiagent/diagnostics.md`. After the task, providers compute deltas so the next agent knows what changed. |
+| **Agent Circuit Breaker** | 2 consecutive failures → degraded (simple tasks only). 5 → quarantined (no tasks). Prevents broken agents from burning API costs. |
+| **Task Dependency Chains** | When Task B depends on Task A, B's worktree starts from A's branch — inheriting all code changes. Agents receive `[PREDECESSOR]` context hints describing what A did. Chain of any length: A → B → C works naturally. |
 
 ## Key Design Decisions
 
 - **File system is the database** — `rename(2)` provides atomicity on NTFS (Windows) and ext4/xfs (Linux). No SQLite, no Redis.
 - **TCP localhost instead of Unix sockets** — cross-platform (Windows, Linux, macOS) with zero platform branches.
 - **Optimistic concurrency for tasks** (version numbers), **pessimistic locking for files** (exclusive leases).
+- **Pull-based change tracking** — agents query the ChangeJournal for changes relevant to their target files. File change notifications are not pushed; knowledge updates are pushed only to busy agents.
 - **Claude Code in interactive terminals** — agents open full interactive Claude Code sessions in new terminal windows. All CLI features (MCP, hooks, skills, slash commands, plan mode) are preserved. LAOL manages task coordination, lock leases, and worktree lifecycle; Claude does the coding with full user control.
-- **Live toolchain queries, not static parsing** — context providers run real compilers, linters, and test runners instead of relying solely on AST indexing. Inspired by the fennara-godot-ai live-editor-query architecture.
+- **Live toolchain queries, not static parsing** — context providers run real compilers, linters, and test runners instead of relying solely on AST indexing.
 - **Shared agent memory** — Knowledge entries from completed tasks are stored on disk and queried by other agents before starting work, preventing duplicate exploration and providing predecessor context for dependency chains.
 
 ## Installation
@@ -314,7 +354,7 @@ Show system overview: task counts, lock count, pool usage.
 {
   "scheduler": {
     "port": 9123,           // TCP port for agent connections
-    "pool_size": 4          // Pre-warmed worktree count (shared pool)
+    "pool_size": 4          // Pre-warmed worktree count
   },
   "merge_checks": [          // Pre-merge CI validation
     { "name": "type-check", "cmd": "npx tsc --noEmit", "timeout": 60 },
@@ -322,7 +362,7 @@ Show system overview: task counts, lock count, pool usage.
   ],
   "merge_driver": "ai-merge",
   "merge_driver_config": {
-    "same_function_strategy": "always_llm",  // Same-function conflicts -> LLM merge
+    "same_function_strategy": "always_llm",  // Same-function conflicts → LLM merge
     "cache_size": 100,
     "cache_ttl": 300,
     "quorum_enabled": false                   // Enable dual-model quorum merge
@@ -336,7 +376,7 @@ Show system overview: task counts, lock count, pool usage.
   "agent": {
     "heartbeat_interval_ms": 25000,
     "checkpoint_min_interval_ms": 30000,
-    "worktree_pool_size": 1,   // Worktrees per agent (default 1; each agent only needs one)
+    "worktree_pool_size": 1,   // Worktrees per agent (default 1)
     "mode": "interactive",     // "piped" for headless, "interactive" for full CLI experience
     "interactive": {
       "terminal_timeout_seconds": 7200,  // Max session duration (2 hours)
@@ -382,10 +422,20 @@ Key config notes:
 - `context_providers.<name>.post_task_enabled` controls whether a provider re-runs after the task to compute deltas. Set to `false` for expensive providers (test is disabled by default).
 - TSC results are automatically cached at `.multiagent/cache/tsc/` keyed by git tree hash.
 
+## Coordination Files (Agent Workspace)
+
+During task execution, agents have access to these files in their worktree's `.multiagent/` directory:
+
+| File | Purpose |
+|------|---------|
+| `.multiagent/diagnostics.md` | Pre-flight diagnostics from all context providers (tsc, eslint, test, git, codebase). Written before task start. |
+| `.multiagent/journal/latest-changes.md` | Recent file changes, index updates, and merges relevant to the agent's target files (queried from ChangeJournal). |
+| `.multiagent/notifications.md` | Knowledge shared by other agents — learnings, summaries, and insights from completed tasks. |
+
 ## Task Lifecycle (End to End)
 
 ```
-User drops task JSON -> tasks/
+User drops task JSON → tasks/
     │
     ▼
 chokidar fires "task_created" event
@@ -393,23 +443,23 @@ chokidar fires "task_created" event
     ▼
 Scheduler.runAssignmentLoop()
     ├── ConflictChecker.canAssign(task)
-    │   ├── Are any target files locked? -> Block
-    │   ├── Is the dependency task done? -> If not, skip
-    │   └── Check registry for semantic warnings -> Inject hints
+    │   ├── Are any target files locked? → Block
+    │   ├── Is the dependency task done? → If not, skip
+    │   └── Check registry for semantic warnings → Inject hints
     │
     ├── CircuitBreaker.canAcceptTask(agent, complexity)
-    │   ├── normal    -> any task
-    │   ├── degraded  -> simple tasks only (<=2 files)
-    │   └── quarantined -> no tasks
+    │   ├── normal    → any task
+    │   ├── degraded  → simple tasks only (≤2 files)
+    │   └── quarantined → no tasks
     │
     ├── LockManager.acquire(task_id, agent_id, files)
     │   ├── Write staging/{task_id}.intent
-    │   ├── For each file: write Lock data, renameSync -> locks/{file}.lock
+    │   ├── For each file: write Lock data, renameSync → locks/{file}.lock
     │   └── On any failure: rollback all prior locks
     │
     ├── TaskStore.updateTask(task_id, status: "in_progress")
     │
-    └── SocketServer -> notify agent: { event: "task_assigned", task_id }
+    └── SocketServer → notify agent: { event: "task_assigned", task_id }
             │
             ▼
 AgentRunner.handleTaskAssigned(msg)
@@ -417,33 +467,35 @@ AgentRunner.handleTaskAssigned(msg)
     └── AgentWorker.executeTask(task, executor)
         ├── Heartbeat.start()              # Renews locks every 25s
         ├── WorktreePool.acquire()         # Grab pre-warmed worktree
+        ├── ChangeJournalClient.query()    # Pull recent changes for target files
+        │   └── Writes .multiagent/journal/latest-changes.md
+        ├── ContextManager.collectPreHints()   # 7 live providers in parallel
+        │   ├── TSC results from cache if tree hash matches (shared across agents)
+        │   ├── Critical hints (tsc, eslint, test) → inline prompt
+        │   └── Full diagnostics → .multiagent/diagnostics.md
         ├── Checkpoint.checkAndRebase()    # Fetch latest main, rebase if needed
         │
-        ├── ContextManager.collectPreHints()   # 7 live providers: tsc, eslint, tests, git, etc.
-        │   ├── TSC results from cache if tree hash matches (shared across agents)
-        │   └── Inject [TYPESCRIPT], [ESLINT], [TEST BASELINE], [GIT], [SYMBOLS], etc.
-        │
-        ├── KnowledgeStore.getByTaskId()   # Query predecessor knowledge (O(1) direct read)
+        ├── KnowledgeStore.getByTaskId()   # Query predecessor knowledge (O(1))
         │   └── Build [PREDECESSOR] hint with dependency task summary
         │
         ├── AgentRunner.createInteractiveExecutor()  # Mode: interactive (default)
-        │   ├── Writes CLAUDE.md to worktree root   # Task context injected
+        │   ├── Writes CLAUDE.md to worktree root   # Task context
         │   ├── InteractiveTerminalOpener opens new terminal window
         │   │   └── Full Claude Code CLI: MCP, hooks, skills, slash commands, plan mode
         │   ├── Polls sentinel file for exit detection
-        │   └── User types /exit or Ctrl+D -> terminal closes
+        │   └── User types /exit or Ctrl+D → terminal closes
         │
         ├── AgentRunner.createPipedExecutor()       # Mode: piped (headless)
         │   └── spawn("claude", [...])  # Prompt piped via stdin, automated execution
         │       ├── Claude reads target files
         │       ├── Claude makes edits
-        │       └── Claude exits 0 -> success
+        │       └── Claude exits 0 → success
         │
         ├── ContextManager.collectPostHints()  # Re-run enabled providers, compute deltas
         │   └── Respects post_task_enabled flag per provider
-        ├── KnowledgeStore.saveDelta()     # Save provider delta (doesn't overwrite main entry)
+        ├── KnowledgeStore.saveDelta()     # Save provider delta
         ├── git add -A && git commit
-        ├── CodebaseIndexer.reindexFiles()     # Keep symbol index fresh (when auto_index: true)
+        ├── CodebaseIndexer.reindexFiles()     # Keep symbol index fresh (auto_index: true)
         ├── git push origin agent/{task_id}
         ├── LockManager.releaseAll()
         ├── TaskStore.updateTask(task_id, status: "done")
@@ -455,8 +507,8 @@ AgentRunner.handleTaskAssigned(msg)
 
 ```bash
 npm install
-npm run build       # TypeScript -> dist/
-npm test            # Vitest (269 tests, 20 files)
+npm run build       # TypeScript → dist/
+npm test            # Vitest (287 tests, 21 files)
 npm run dev         # Watch mode
 ```
 
@@ -468,19 +520,20 @@ src/
 ├── task/            # Task JSON CRUD + chokidar watcher
 ├── lock/            # Two-phase commit locks + TTL leases + symbol resolver
 ├── scheduler/       # Event-driven scheduler + conflict checker + circuit breaker + health monitor
-├── agent/           # Agent worker + heartbeat + checkpoint + interactive/piped executor + Claude executor
+├── agent/           # Agent worker + heartbeat + checkpoint + interactive/piped executors
 ├── context/         # Context provider pipeline (7 providers: tsc, eslint, test, git, python, codebase, custom)
 │   ├── providers/   # Individual provider implementations
 │   └── tsc-cache.ts # Shared TSC result cache (tree-hash keyed)
+├── journal/         # ChangeJournal + agent query client (pull-based change tracking)
 ├── knowledge/       # Shared agent memory — KnowledgeStore (one JSON file per task)
 ├── worktree/        # Git worktree pool
 ├── merge/           # 3-level merge: L1 auto / L2 AST / L3 LLM + sandbox validator
 ├── events/          # EventBus (internal) + TCP socket server/client (cross-platform IPC)
 ├── wal/             # Write-ahead log for crash recovery
 ├── registry/        # Semantic change registry (module export tracking)
-├── codebase/        # Symbol-level indexer (TS AST extraction, keyword search, API docs)
-├── cli/             # Commander-based CLI (8 command groups)
-└── __tests__/       # 20 test files, 269 tests
+├── codebase/        # Symbol-level indexer (TS/Python AST extraction, keyword search, API docs)
+├── cli/             # Commander-based CLI
+└── __tests__/       # 21 test files, 287 tests
 ```
 
 ## License

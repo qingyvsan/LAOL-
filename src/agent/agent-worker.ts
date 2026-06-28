@@ -12,8 +12,11 @@ import { RegistryManager } from "../registry/registry-manager";
 import { KnowledgeStore } from "../knowledge/knowledge-store";
 import { ContextManager } from "../context/manager";
 import { CodebaseIndexer } from "../codebase/indexer";
+import { propagateFile } from "./file-propagator";
+import { notifyKnowledgeUpdated } from "./notification-writer";
+import { ChangeJournalClient } from "../journal/change-journal-client";
 import { loadConfig } from "../config";
-import type { Task, LaolConfig } from "../data/models";
+import type { Task, LaolConfig, ContextHint } from "../data/models";
 
 /**
  * Error thrown when an interactive terminal session times out.
@@ -59,7 +62,7 @@ export class AgentWorker {
   private lockManager: LockManager;
   private leaseManager: LeaseManager;
   private worktreePool: WorktreePool;
-  private socketClient: SocketClient;
+  private socketClient: SocketClient | null;
   private registryManager: RegistryManager;
   private knowledgeStore: KnowledgeStore;
   private contextManager: ContextManager;
@@ -73,6 +76,9 @@ export class AgentWorker {
   // Getter for heartbeat to access current lock files
   private activeLockFiles: string[] = [];
 
+  // Socket event handlers (for coordination mode — cleaned up in cleanup())
+  private socketHandlers: Map<string, (msg: import("../events/socket-server").SocketMessage) => void> = new Map();
+
   constructor(
     repoRoot: string,
     agentId: string,
@@ -80,7 +86,7 @@ export class AgentWorker {
     lockManager: LockManager,
     leaseManager: LeaseManager,
     worktreePool: WorktreePool,
-    socketClient: SocketClient,
+    socketClient: SocketClient | null,
     registryManager: RegistryManager,
     knowledgeStore: KnowledgeStore
   ) {
@@ -115,7 +121,7 @@ export class AgentWorker {
    */
   async executeTask(
     task: Task,
-    executor: (worktreePath: string, task: Task, contextHints: string[]) => Promise<{ stdout: string }>,
+    executor: (worktreePath: string, task: Task, contextHints: string[]) => Promise<{ stdout: string; summary?: string }>,
     discoveryExecutor?: (worktreePath: string, task: Task) => Promise<string[]>
   ): Promise<void> {
     this.currentTask = task;
@@ -131,6 +137,35 @@ export class AgentWorker {
       const baseBranch = this.resolveBaseBranch(task);
       console.log(`[agent ${this.agentId}] Acquiring worktree for task ${taskId.slice(0, 8)} (base: ${baseBranch})...`);
       const handle = this.worktreePool.acquire(taskId, baseBranch);
+
+      // 2b. Set up socket event listeners (coordination mode)
+      if (this.socketClient) {
+        // file_propagate — copy latest file version from another agent's worktree
+        const onFilePropagate = (msg: import("../events/socket-server").SocketMessage) => {
+          const file = msg.file as string;
+          const sourceWorktree = msg.source_worktree as string;
+          if (file && sourceWorktree) {
+            const ok = propagateFile(sourceWorktree, handle.path, file);
+            if (ok) {
+              console.log(`[agent ${this.agentId}] Propagated file: ${file}`);
+            }
+          }
+        };
+        this.socketClient.on("file_propagate", onFilePropagate);
+        this.socketHandlers.set("file_propagate", onFilePropagate);
+
+        // knowledge_updated — another agent shared new knowledge (push — global value)
+        const onKnowledgeUpdated = (msg: import("../events/socket-server").SocketMessage) => {
+          const sourceAgent = msg.agent_id as string;
+          const summary = msg.summary as string;
+          if (sourceAgent && sourceAgent !== this.agentId && summary) {
+            notifyKnowledgeUpdated(handle.path, sourceAgent, summary);
+            console.log(`[agent ${this.agentId}] Knowledge updated: ${sourceAgent}`);
+          }
+        };
+        this.socketClient.on("knowledge_updated", onKnowledgeUpdated);
+        this.socketHandlers.set("knowledge_updated", onKnowledgeUpdated);
+      }
 
       // 3. Setup checkpoint
       this.checkpoint = new Checkpoint(
@@ -161,8 +196,10 @@ export class AgentWorker {
 
         console.log(`[agent ${this.agentId}] Discovered ${discoveredFiles.length} files: ${discoveredFiles.join(", ")}`);
 
-        // Request locks for discovered files
-        const grantedFiles = await this.socketClient.requestLocksAsync(taskId, discoveredFiles);
+        // Request locks for discovered files (or grant all in standalone mode)
+        const grantedFiles = this.socketClient
+          ? await this.socketClient.requestLocksAsync(taskId, discoveredFiles)
+          : discoveredFiles;
         console.log(`[agent ${this.agentId}] Locks granted for: ${grantedFiles.join(", ")}`);
 
         this.activeLockFiles = grantedFiles;
@@ -177,8 +214,25 @@ export class AgentWorker {
         this.activeLockFiles = task.target_files.map((f) => f); // copy
       }
 
-      // 7. Start heartbeat (now that we have locks)
-      this.heartbeat.start(() => this.activeLockFiles);
+      // 7. Start heartbeat (now that we have locks) — only when connected to scheduler
+      if (this.socketClient) {
+        this.heartbeat.start(() => this.activeLockFiles);
+      }
+
+      // 7b. Query ChangeJournal for recent changes relevant to target files
+      if (this.socketClient) {
+        try {
+          const journalClient = new ChangeJournalClient(this.socketClient);
+          const journalEntries = await journalClient.queryJournal(task.target_files);
+          journalClient.writeLocalJournal(handle.path, journalEntries);
+          console.log(
+            `[agent ${this.agentId}] Journal queried: ${journalEntries.length} entries`
+          );
+        } catch (err) {
+          // Non-fatal — journal query failure must not block task execution
+          console.warn(`[agent ${this.agentId}] Journal query warning: ${err}`);
+        }
+      }
 
       // 8. Collect context hints from live providers
       const contextHints: string[] = [];
@@ -187,7 +241,8 @@ export class AgentWorker {
         task,
         handle.path
       );
-      contextHints.push(...liveHints.map((h) => ContextManager.formatHint(h)));
+      const criticalHints = this.prepareDiagnostics(handle.path, liveHints);
+      contextHints.push(...criticalHints);
 
       // 10. Pre-work checkpoint (structural — rebase before editing)
       try {
@@ -211,7 +266,7 @@ export class AgentWorker {
 
       // 11. Execute the actual AI work
       console.log(`[agent ${this.agentId}] Starting work on task ${taskId.slice(0, 8)}`);
-      await executor(handle.path, task, contextHints);
+      const execResult = await executor(handle.path, task, contextHints);
 
       // 11b. Post-execution lock validation — detect files modified without locks
       const modifiedFiles = this.getModifiedFiles(handle.path);
@@ -308,6 +363,15 @@ export class AgentWorker {
       // 13. Push branch
       this.pushBranch(handle.path, task);
 
+      // 13b. Report modified files to scheduler (fine-grained lock release).
+      // Must be AFTER commit+push so the propagated version is final.
+      if (this.socketClient && modifiedFiles.length > 0) {
+        this.socketClient.notifyFilesModified(modifiedFiles, handle.path);
+        console.log(
+          `[agent ${this.agentId}] Reported ${modifiedFiles.length} modified file(s) to scheduler`
+        );
+      }
+
       // 14. Update registry for modified files
       for (const file of this.activeLockFiles) {
         this.registryManager.updateEntry(
@@ -318,7 +382,7 @@ export class AgentWorker {
       }
 
       // 15. Complete task
-      this.completeTask(taskId);
+      this.completeTask(taskId, execResult?.summary);
 
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -343,10 +407,9 @@ export class AgentWorker {
     const newFiles = files.filter((f) => !this.activeLockFiles.includes(f));
     if (newFiles.length === 0) return [];
 
-    const grantedFiles = await this.socketClient.requestLocksAsync(
-      this.currentTask.id,
-      newFiles
-    );
+    const grantedFiles = this.socketClient
+      ? await this.socketClient.requestLocksAsync(this.currentTask.id, newFiles, { skipPropagation: true })
+      : newFiles;
 
     this.activeLockFiles.push(...grantedFiles);
     return grantedFiles;
@@ -553,7 +616,7 @@ export class AgentWorker {
     }
   }
 
-  private completeTask(taskId: string): void {
+  private completeTask(taskId: string, summary?: string): void {
     // Release locks
     for (const file of this.activeLockFiles) {
       this.lockManager.release(file);
@@ -565,8 +628,8 @@ export class AgentWorker {
       updated_at: Date.now(),
     }));
 
-    // Notify scheduler
-    this.socketClient.notifyTaskDone(taskId);
+    // Notify scheduler (with knowledge summary so other agents benefit)
+    this.socketClient?.notifyTaskDone(taskId, summary);
     console.log(`[agent ${this.agentId}] Task ${taskId.slice(0, 8)} DONE`);
   }
 
@@ -597,7 +660,8 @@ export class AgentWorker {
       task,
       worktreePath
     );
-    contextHints.push(...liveHints.map((h) => ContextManager.formatHint(h)));
+    const criticalHints = this.prepareDiagnostics(worktreePath, liveHints);
+    contextHints.push(...criticalHints);
 
     // Pre-work checkpoint (rebase to get latest code for analysis)
     try {
@@ -633,7 +697,7 @@ export class AgentWorker {
       metadata: { read_only: true },
     }));
 
-    this.socketClient.notifyTaskDone(taskId);
+    this.socketClient?.notifyTaskDone(taskId, `Read-only analysis: ${task.description.slice(0, 200)}`);
     console.log(`[agent ${this.agentId}] Task ${taskId.slice(0, 8)} DONE (read-only)`);
   }
 
@@ -664,7 +728,7 @@ export class AgentWorker {
       metadata: { read_only: true },
     }));
 
-    this.socketClient.notifyTaskDone(taskId);
+    this.socketClient?.notifyTaskDone(taskId, `Exploration completed: no files to modify`);
     console.log(`[agent ${this.agentId}] Task ${taskId.slice(0, 8)} DONE (read-only)`);
   }
 
@@ -686,7 +750,7 @@ export class AgentWorker {
       }));
 
       // Notify scheduler (task is stuck, not failed — dependency cascade is blocked)
-      this.socketClient.notifyTaskFailed(taskId, `Interactive timeout: ${reason}`);
+      this.socketClient?.notifyTaskFailed(taskId, `Interactive timeout: ${reason}`);
       return;
     }
 
@@ -702,10 +766,18 @@ export class AgentWorker {
     }));
 
     // Notify scheduler
-    this.socketClient.notifyTaskFailed(taskId, reason);
+    this.socketClient?.notifyTaskFailed(taskId, reason);
   }
 
   private cleanup(taskId: string): void {
+    // Remove all socket event listeners
+    if (this.socketClient && typeof this.socketClient.off === "function") {
+      for (const [event, handler] of this.socketHandlers) {
+        this.socketClient.off(event, handler);
+      }
+      this.socketHandlers.clear();
+    }
+
     // Stop heartbeat
     this.heartbeat.stop();
 
@@ -798,5 +870,49 @@ export class AgentWorker {
     }
 
     return lines.join("\n");
+  }
+
+  /**
+   * Write ALL provider hints to `.multiagent/diagnostics.md` and return
+   * only the critical ones (tsc, eslint, test) for inline prompt injection.
+   *
+   * Git and Codebase hints overlap with the ChangeJournal (which already
+   * tells the agent what files changed). Moving them to a file saves
+   * ~350 tokens per task while keeping them available on demand.
+   */
+  private prepareDiagnostics(
+    worktreePath: string,
+    liveHints: ContextHint[]
+  ): string[] {
+    const diagnosticsDir = path.join(worktreePath, ".multiagent");
+    if (!fs.existsSync(diagnosticsDir)) {
+      fs.mkdirSync(diagnosticsDir, { recursive: true });
+    }
+
+    // Write ALL hints to diagnostics.md (for on-demand reading)
+    const lines: string[] = [];
+    lines.push("# Pre-flight Diagnostics");
+    lines.push("");
+    lines.push("Generated before task execution. Critical issues from tsc, eslint,");
+    lines.push("and test are also included in the prompt. Git and codebase info is");
+    lines.push("available here on demand.");
+    lines.push("");
+
+    const formatted = liveHints.map((h) => ContextManager.formatHint(h));
+    for (const hint of formatted) {
+      lines.push(`- ${hint.replace(/\n/g, "\n  ")}`);
+    }
+
+    fs.writeFileSync(
+      path.join(diagnosticsDir, "diagnostics.md"),
+      lines.join("\n"),
+      "utf-8"
+    );
+
+    // Return only critical hints for inline injection (tsc, eslint, test)
+    const criticalSources = new Set(["typescript", "eslint", "test"]);
+    return liveHints
+      .filter((h) => criticalSources.has(h.source))
+      .map((h) => ContextManager.formatHint(h));
   }
 }

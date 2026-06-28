@@ -116,11 +116,12 @@ export class SocketClient extends EventEmitter {
   /**
    * Notify the scheduler that a task is done.
    */
-  notifyTaskDone(taskId: string): boolean {
+  notifyTaskDone(taskId: string, summary?: string): boolean {
     return this.send({
       type: "task_done",
       agent_id: this.agentId,
       task_id: taskId,
+      summary,
     });
   }
 
@@ -137,24 +138,42 @@ export class SocketClient extends EventEmitter {
   }
 
   /**
+   * Notify the scheduler that files have been modified and locks can be released.
+   * Used for fine-grained lock release — agent reports files it's done with.
+   */
+  notifyFilesModified(files: string[], worktree: string): boolean {
+    return this.send({
+      type: "file_modified",
+      agent_id: this.agentId,
+      files,
+      worktree,
+    });
+  }
+
+  /**
    * Request locks for additional files during task execution.
    */
-  requestLocks(taskId: string, files: string[]): boolean {
+  requestLocks(taskId: string, files: string[], opts?: { skipPropagation?: boolean }): boolean {
     return this.send({
       type: "lock_request",
       agent_id: this.agentId,
       task_id: taskId,
       files,
+      skip_propagation: opts?.skipPropagation === true ? true : undefined,
     });
   }
 
   /**
    * Request locks and wait for a response (Promise-based, for sync flows).
    * Returns the granted files array, or throws if denied.
+   *
+   * @param opts.skipPropagation - If true, the scheduler will NOT propagate
+   *   dirty files into the worktree before granting the lock. Used by post-hoc
+   *   lock expansion, where the agent already modified the file locally.
    */
-  async requestLocksAsync(taskId: string, files: string[]): Promise<string[]> {
+  async requestLocksAsync(taskId: string, files: string[], opts?: { skipPropagation?: boolean }): Promise<string[]> {
     return new Promise((resolve, reject) => {
-      const INITIAL_TIMEOUT_MS = 30000;
+      const INITIAL_TIMEOUT_MS = 45000; // 45s — gives 15s margin over scheduler's 30s refresh
       let timeout: NodeJS.Timeout;
 
       const createTimeout = () => setTimeout(() => {
@@ -204,6 +223,7 @@ export class SocketClient extends EventEmitter {
         agent_id: this.agentId,
         task_id: taskId,
         files,
+        skip_propagation: opts?.skipPropagation === true ? true : undefined,
       });
 
       if (!sent) {
@@ -212,6 +232,52 @@ export class SocketClient extends EventEmitter {
         this.off("lock_denied", onDenied);
         this.off("lock_waiting", onWaiting);
         reject(new Error("Failed to send lock request (not connected)"));
+      }
+    });
+  }
+
+  /**
+   * Query the scheduler's ChangeJournal for recent changes.
+   * Pull-based — only returns what the agent asks for.
+   */
+  queryChanges(filter: {
+    qtype?: string;
+    files?: string[];
+    since?: number;
+  }): Promise<unknown[]> {
+    return new Promise((resolve, reject) => {
+      const reqId = crypto.randomUUID?.() ?? Math.random().toString(36).slice(2);
+      const TIMEOUT_MS = 15_000;
+      let timeout: NodeJS.Timeout;
+
+      const onResult = (msg: SocketMessage) => {
+        if (msg.req_id === reqId) {
+          clearTimeout(timeout);
+          this.off("change_result", onResult);
+          resolve((msg.changes as unknown[]) ?? []);
+        }
+      };
+
+      timeout = setTimeout(() => {
+        this.off("change_result", onResult);
+        reject(new Error("Change journal query timed out"));
+      }, TIMEOUT_MS);
+
+      this.on("change_result", onResult);
+
+      const sent = this.send({
+        type: "change_query",
+        agent_id: this.agentId,
+        req_id: reqId,
+        qtype: filter.qtype,
+        files: filter.files,
+        since: filter.since,
+      });
+
+      if (!sent) {
+        clearTimeout(timeout);
+        this.off("change_result", onResult);
+        reject(new Error("Failed to send change_query (not connected)"));
       }
     });
   }

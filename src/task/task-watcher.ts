@@ -18,6 +18,7 @@ export class TaskWatcher {
   private taskStore: TaskStore;
   private eventBus: EventBus;
   private tasksDir: string;
+  private emittedTaskIds = new Set<string>();
 
   constructor(repoRoot: string, taskStore: TaskStore, eventBus: EventBus) {
     this.tasksDir = path.join(repoRoot, ".multiagent", "tasks");
@@ -48,14 +49,17 @@ export class TaskWatcher {
       },
     });
 
-    // Safety-net fallback: periodically rescan for pending tasks.
-    // On Windows/NTFS, chokidar may occasionally miss atomic-rename events,
-    // and atomicWrite (tmp → renameSync) can be invisible on some file systems.
-    // A cheap directory listing every few seconds guarantees no task is missed.
+    // Safety-net fallback: periodically rescan for NEW pending tasks.
+    // On Windows/NTFS, chokidar may occasionally miss atomic-rename events.
+    // Tracks already-emitted task IDs to avoid re-emitting known tasks and
+    // triggering redundant conflict checks every cycle.
     this.pollTimer = setInterval(() => {
       const pending = this.taskStore.listTasks({ status: "pending" });
       for (const task of pending) {
-        this.eventBus.emit("task_created", task);
+        if (!this.emittedTaskIds.has(task.id)) {
+          this.emittedTaskIds.add(task.id);
+          this.eventBus.emit("task_created", task);
+        }
       }
     }, 5000);
 
@@ -66,6 +70,7 @@ export class TaskWatcher {
 
       const task = this.taskStore.getTask(this.extractId(filePath));
       if (task) {
+        this.emittedTaskIds.add(task.id);
         this.eventBus.emit("task_created", task);
       }
     });
@@ -128,6 +133,7 @@ export class TaskWatcher {
   scanExisting(): Task[] {
     const pending = this.taskStore.listTasks({ status: "pending" });
     for (const task of pending) {
+      this.emittedTaskIds.add(task.id);
       this.eventBus.emit("task_created", task);
     }
     return pending;

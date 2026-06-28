@@ -12,6 +12,9 @@ import { HealthMonitor } from "./health-monitor";
 import { CircuitBreaker } from "./circuit-breaker";
 import { SocketServer } from "../events/socket-server";
 import { WalManager } from "../wal/wal-manager";
+import { MergeDriver } from "../merge/merge-driver";
+import { ClaudeLLMProvider } from "../merge/claude-llm-provider";
+import { ChangeJournal } from "../journal/change-journal";
 import { loadConfig } from "../config";
 import type { Task, Lock, LaolConfig, WaitingLockRequest } from "../data/models";
 
@@ -44,6 +47,7 @@ export class Scheduler {
   private circuitBreaker: CircuitBreaker;
   private socketServer: SocketServer;
   private walManager: WalManager;
+  private changeJournal: ChangeJournal;
 
   // Agent tracking: agentId → { currentTask, connectedAt, heldLocks }
   private agents = new Map<string, AgentInfo>();
@@ -56,6 +60,16 @@ export class Scheduler {
 
   // Runtime lock waiting queue: file → list of waiting requests
   private waitingLockRequests = new Map<string, WaitingLockRequest[]>();
+
+  // Dirty file tracking: file → { agentId, worktree, committedAt }
+  // When an agent modifies a file and releases the lock, it's marked "dirty".
+  // The next agent that requests this file gets the latest version propagated.
+  private dirtyFiles = new Map<string, { agentId: string; worktree: string; committedAt: number }>();
+
+  // Agent worktree mapping: agentId → worktree path
+  // Standalone agents report their worktree path so the scheduler can coordinate
+  // file propagation between worktrees.
+  private agentWorktrees = new Map<string, string>();
 
   // Wait-for graph for deadlock detection: agentId → set of agent IDs it's waiting for
   private waitForGraph = new Map<string, Set<string>>();
@@ -96,6 +110,7 @@ export class Scheduler {
     this.circuitBreaker = new CircuitBreaker();
     this.socketServer = new SocketServer(this.config.scheduler.port);
     this.walManager = new WalManager(repoRoot);
+    this.changeJournal = new ChangeJournal(repoRoot);
   }
 
   // ---- Lifecycle ----
@@ -116,6 +131,9 @@ export class Scheduler {
       console.log(`[scheduler] Recovering ${pending.length} uncommitted WAL entries...`);
       this.reconcileWalEntries(pending);
     }
+
+    // 1b. Load ChangeJournal (replay NDJSON)
+    this.changeJournal.load();
 
     // 2. Start TCP server
     const port = await this.socketServer.start();
@@ -144,16 +162,30 @@ export class Scheduler {
       }
     });
 
-    this.socketServer.on("task_completed", (agentId: string, taskId: string) => {
-      this.handleTaskCompleted(agentId, taskId);
+    this.socketServer.on("task_completed", (agentId: string, taskId: string, summary?: string) => {
+      this.handleTaskCompleted(agentId, taskId, summary);
     });
 
     this.socketServer.on("task_failed", (agentId: string, taskId: string, reason: string) => {
       this.handleTaskFailed(agentId, taskId, reason);
     });
 
-    this.socketServer.on("lock_request", (agentId: string, taskId: string, files: string[]) => {
-      this.handleLockRequest(agentId, taskId, files);
+    this.socketServer.on("lock_request", (agentId: string, taskId: string, files: string[], skipPropagation?: boolean) => {
+      this.handleLockRequest(agentId, taskId, files, skipPropagation);
+    });
+
+    this.socketServer.on("file_modified", (agentId: string, files: string[], worktree: string) => {
+      this.handleFileModified(agentId, files, worktree);
+    });
+
+    this.socketServer.on("change_query", (agentId: string, reqId: string, qtype: string, files?: string[], since?: number) => {
+      const results = this.changeJournal.query({
+        type: qtype as "file" | "index" | "knowledge" | "merge" | "all",
+        files: files ?? [],
+        since,
+        limit: 100,
+      });
+      this.socketServer.sendChangeResult(agentId, reqId, results);
     });
 
     this.socketServer.on("shutdown_requested", () => {
@@ -178,7 +210,10 @@ export class Scheduler {
     });
 
     this.eventBus.on("task_completed", (task: Task) => {
-      this.handleMergeRequired(task);
+      // Fire-and-forget: merge runs async, does not block the scheduler
+      this.handleMergeRequired(task).catch((err) => {
+        console.error(`[scheduler] Unhandled merge error: ${err}`);
+      });
     });
 
     // 5. Start task watcher
@@ -482,9 +517,57 @@ export class Scheduler {
     }
   }
 
+  /**
+   * Handle a file_modified message from an agent.
+   * The agent reports files it has finished modifying (committed locally).
+   * These files are marked "dirty" so the next agent requesting them
+   * receives the latest version via file propagation.
+   */
+  private handleFileModified(agentId: string, files: string[], worktree: string): void {
+    // Track the agent's worktree path
+    if (worktree) {
+      this.agentWorktrees.set(agentId, worktree);
+    }
+
+    // Release locks on the reported files
+    const heldLocks = this.agentLocks.get(agentId);
+    if (heldLocks) {
+      for (const file of files) {
+        heldLocks.delete(file);
+        this.lockManager.release(file);
+        this.eventBus.emit("lock_released", file);
+      }
+    }
+
+    // Mark files as dirty with propagation info
+    for (const file of files) {
+      this.dirtyFiles.set(file, {
+        agentId,
+        worktree: worktree || this.agentWorktrees.get(agentId) || "",
+        committedAt: Date.now(),
+      });
+    }
+
+    console.log(
+      `[scheduler] Agent "${agentId}" modified ${files.length} file(s): ${files.join(", ")}`
+    );
+
+    // Record to ChangeJournal (pull model — agents query on demand)
+    // One "file" entry per modified file; index updates are recorded
+    // separately when the CodebaseIndexer actually rebuilds the index.
+    for (const file of files) {
+      this.changeJournal.recordFileChange(file, agentId, worktree);
+    }
+
+    // Retry any waiting lock requests for these files
+    for (const file of files) {
+      this.retryWaitingLockRequests(file);
+    }
+  }
+
   // ---- Task Lifecycle ----
 
-  private handleTaskCompleted(agentId: string, taskId: string): void {
+  private handleTaskCompleted(agentId: string, taskId: string, summary?: string): void {
     const task = this.taskStore.getTask(taskId);
     if (!task) return;
 
@@ -520,6 +603,24 @@ export class Scheduler {
 
     this.eventBus.emit("task_completed", task);
     console.log(`[scheduler] Task ${taskId.slice(0, 8)} completed by ${agentId}`);
+
+    // Record knowledge update to ChangeJournal for future queries
+    this.changeJournal.recordKnowledgeUpdate(taskId, agentId, summary || task.description);
+
+    // Push knowledge_updated only to agents currently executing a task
+    // (they benefit from real-time knowledge; idle agents query the journal
+    // on their next task start).
+    const busyAgents = Array.from(this.agents.values())
+      .filter((a) => a.currentTask !== null && a.agentId !== agentId)
+      .map((a) => a.agentId);
+    if (busyAgents.length > 0) {
+      this.socketServer.sendToAgents(busyAgents, {
+        type: "knowledge_updated",
+        task_id: taskId,
+        agent_id: agentId,
+        summary: summary || task.description,
+      });
+    }
 
     // Try to assign next pending task
     this.assignNextPending();
@@ -599,10 +700,134 @@ export class Scheduler {
     }
   }
 
-  private handleMergeRequired(task: Task): void {
-    // Merge will be handled by the merge driver (Phase 7)
-    // For now, just emit the event
-    this.eventBus.emit("merge_required", task.id, `agent/${task.id}`);
+  /**
+   * Handle merge required — run the 3-level merge pipeline (auto → AST → LLM)
+   * when an agent completes a task and has pushed its branch.
+   *
+   * Uses a temporary worktree to avoid polluting the main repo's working directory.
+   */
+  private async handleMergeRequired(task: Task): Promise<void> {
+    const branch = `agent/${task.id}`;
+    const mergeDir = path.join(this.repoRoot, ".multiagent", "merges", task.id);
+
+    this.eventBus.emit("merge_required", task.id, branch);
+
+    try {
+      // Verify the agent branch exists (remote or local)
+      try {
+        execSync(`git rev-parse --verify origin/${branch}`, {
+          cwd: this.repoRoot, stdio: "pipe", timeout: 5000,
+        });
+      } catch {
+        try {
+          execSync(`git rev-parse --verify ${branch}`, {
+            cwd: this.repoRoot, stdio: "pipe", timeout: 5000,
+          });
+        } catch {
+          console.log(`[scheduler] Merge skipped: branch "${branch}" not found`);
+          return;
+        }
+      }
+
+      // Create a temporary worktree for the merge
+      fs.mkdirSync(mergeDir, { recursive: true });
+      try {
+        execSync(`git worktree add --no-checkout "${mergeDir}" main`, {
+          cwd: this.repoRoot, stdio: "pipe", timeout: 10_000,
+        });
+      } catch {
+        // Worktree may already exist — try to reuse it
+        try {
+          execSync(`git checkout main`, { cwd: mergeDir, stdio: "pipe", timeout: 10_000 });
+          execSync(`git pull origin main`, { cwd: mergeDir, stdio: "pipe", timeout: 15_000 });
+        } catch {
+          // Continue with whatever state exists
+        }
+      }
+
+      // Build LLM provider from config
+      const llmProvider = new ClaudeLLMProvider({
+        model: this.config.llm.model,
+        timeoutMs: 60_000,
+        binaryPath: this.config.claude_executor.binary_path,
+      });
+
+      let quorumProvider: ClaudeLLMProvider | undefined;
+      if (this.config.merge_driver_config.quorum_enabled && this.config.llm.secondary_model) {
+        quorumProvider = new ClaudeLLMProvider({
+          model: this.config.llm.secondary_model,
+          timeoutMs: 60_000,
+          binaryPath: this.config.claude_executor.binary_path,
+        });
+      }
+
+      const driver = new MergeDriver({
+        worktreePath: mergeDir,
+        llmProvider,
+        quorumProvider,
+        mergeChecks: this.config.merge_checks,
+      });
+
+      console.log(`[scheduler] Starting merge: ${branch} → main`);
+      const result = await driver.merge("main", branch);
+
+      // Log resolution details
+      if (result.resolutions.length > 0) {
+        for (const r of result.resolutions) {
+          const status = r.resolved ? "resolved" : "unresolved";
+          console.log(`[scheduler]   ${r.file}#${r.blockIndex} [${r.method}] — ${status}`);
+        }
+      }
+
+      // Push if successful
+      if (result.success) {
+        try {
+          execSync("git push origin main", {
+            cwd: mergeDir, stdio: "pipe", timeout: 15_000,
+          });
+          console.log(`[scheduler] Merge completed and pushed: ${branch} → main`);
+        } catch (pushErr) {
+          console.error(`[scheduler] Merge push failed: ${pushErr}`);
+        }
+        // Record merge to ChangeJournal — main branch has new merged code
+        this.changeJournal.recordMergeCompleted(task.id, task.target_files);
+      } else {
+        console.warn(`[scheduler] Merge incomplete: ${result.error ?? "validation failed"}`);
+      }
+
+      // Notify agents that merge is done (so they can rebase)
+      this.socketServer.broadcast({
+        type: "merge_completed",
+        task_id: task.id,
+        method: result.method,
+        success: result.success,
+      });
+
+      if (result.success) {
+        this.eventBus.emit("merge_completed", task.id);
+      } else {
+        this.eventBus.emit("merge_rejected", task.id, result.error ?? "merge failed");
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(`[scheduler] Merge error for task ${task.id.slice(0, 8)}: ${reason}`);
+      this.eventBus.emit("merge_rejected", task.id, reason);
+    } finally {
+      // Clean up the temporary merge worktree
+      try {
+        execSync(`git worktree remove --force "${mergeDir}"`, {
+          cwd: this.repoRoot, stdio: "pipe", timeout: 10_000,
+        });
+      } catch {
+        // Manual cleanup fallback
+        try {
+          fs.rmSync(mergeDir, { recursive: true, force: true });
+          execSync("git worktree prune", {
+            cwd: this.repoRoot, stdio: "pipe", timeout: 5000,
+          });
+        } catch { /* best effort */ }
+      }
+    }
   }
 
   /**
@@ -612,13 +837,32 @@ export class Scheduler {
    * When a lock is held by another agent, the request is queued (lock_waiting)
    * instead of rejected immediately. Deadlock detection runs before queuing.
    */
-  private handleLockRequest(agentId: string, taskId: string, files: string[]): void {
+  private handleLockRequest(agentId: string, taskId: string, files: string[], skipPropagation = false): void {
     // Deduplicate and check which files the agent already has locked
     const currentLocks = this.agentLocks.get(agentId) ?? new Set();
     const newFiles = files.filter((f) => !currentLocks.has(f));
 
     if (newFiles.length === 0) {
-      // All files already locked — grant immediately
+      // All files already locked — grant immediately.
+      // Check dirty files for propagation (unless skipPropagation is set
+      // for post-hoc lock expansion, where the agent already has local changes).
+      if (!skipPropagation) {
+        for (const file of files) {
+          const dirty = this.dirtyFiles.get(file);
+          if (dirty && dirty.agentId !== agentId && dirty.worktree) {
+            this.socketServer.sendFilePropagate(
+              agentId, file, dirty.worktree, dirty.agentId
+            );
+            this.dirtyFiles.delete(file);
+          }
+        }
+      } else {
+        // Post-hoc lock expansion: clear dirty flags without propagating
+        // (agent already has its own modifications)
+        for (const file of files) {
+          this.dirtyFiles.delete(file);
+        }
+      }
       this.socketServer.sendLockGranted(agentId, taskId, files);
       return;
     }
@@ -691,6 +935,30 @@ export class Scheduler {
         currentLocks.add(file);
       }
       this.agentLocks.set(agentId, currentLocks);
+
+      // Check dirty files — if any file was modified by another agent,
+      // tell the requesting agent to propagate the latest version.
+      // Skip when skipPropagation is set (post-hoc lock expansion —
+      // the agent already has its own local modifications).
+      if (!skipPropagation) {
+        for (const file of files) {
+          const dirty = this.dirtyFiles.get(file);
+          if (dirty && dirty.agentId !== agentId && dirty.worktree) {
+            this.socketServer.sendFilePropagate(
+              agentId, file, dirty.worktree, dirty.agentId
+            );
+            console.log(
+              `[scheduler] File "${file}" propagated from agent "${dirty.agentId}" to agent "${agentId}"`
+            );
+            this.dirtyFiles.delete(file);
+          }
+        }
+      } else {
+        // Post-hoc lock expansion: clear dirty flags without propagating
+        for (const file of files) {
+          this.dirtyFiles.delete(file);
+        }
+      }
 
       // Grant the locks
       this.socketServer.sendLockGranted(agentId, taskId, files);

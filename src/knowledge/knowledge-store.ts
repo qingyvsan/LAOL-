@@ -28,6 +28,10 @@ export interface KnowledgeEntry {
 export class KnowledgeStore {
   private knowledgeDir: string;
 
+  // In-memory cache to avoid re-reading all JSON files on every query.
+  private cache: { entries: KnowledgeEntry[]; until: number } | null = null;
+  private static CACHE_TTL_MS = 5 * 60_000; // 5 min — knowledge is rarely time-critical
+
   constructor(repoRoot: string) {
     this.knowledgeDir = path.join(repoRoot, ".multiagent", "knowledge");
   }
@@ -42,12 +46,30 @@ export class KnowledgeStore {
 
     const filePath = path.join(this.knowledgeDir, `${entry.task_id}.json`);
     fs.writeFileSync(filePath, JSON.stringify(entry, null, 2), "utf-8");
+
+    // Update cache in-place instead of invalidating — avoids re-reading
+    // all files when tasks complete frequently
+    if (this.cache) {
+      // Replace existing entry for same task or append
+      const idx = this.cache.entries.findIndex((e) => e.task_id === entry.task_id);
+      if (idx >= 0) {
+        this.cache.entries[idx] = entry;
+      } else {
+        this.cache.entries.push(entry);
+      }
+      this.cache.entries.sort((a, b) => b.created_at - a.created_at);
+    }
   }
 
   /**
    * Load all knowledge entries, most recent first.
    */
   loadAll(): KnowledgeEntry[] {
+    // Return cached entries if still fresh
+    if (this.cache && Date.now() < this.cache.until) {
+      return this.cache.entries;
+    }
+
     if (!fs.existsSync(this.knowledgeDir)) return [];
 
     const entries: KnowledgeEntry[] = [];
@@ -66,6 +88,8 @@ export class KnowledgeStore {
 
     // Most recent first
     entries.sort((a, b) => b.created_at - a.created_at);
+
+    this.cache = { entries, until: Date.now() + KnowledgeStore.CACHE_TTL_MS };
     return entries;
   }
 
@@ -97,6 +121,7 @@ export class KnowledgeStore {
     }
     const filePath = path.join(this.knowledgeDir, `${entry.task_id}_delta.json`);
     fs.writeFileSync(filePath, JSON.stringify(entry, null, 2), "utf-8");
+    // Delta files don't affect the main knowledge cache — no invalidation needed
   }
 
   /**

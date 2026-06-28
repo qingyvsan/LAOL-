@@ -152,6 +152,9 @@ function makeMocks() {
     socketClient: {
       notifyTaskDone: vi.fn(),
       notifyTaskFailed: vi.fn(),
+      notifyFilesModified: vi.fn(),
+      on: vi.fn(),
+      off: vi.fn(),
     },
     registryManager: {
       updateEntry: vi.fn(),
@@ -218,7 +221,7 @@ describe("AgentWorker — lifecycle", () => {
     );
 
     // Scheduler notified
-    expect(mocks.socketClient.notifyTaskDone).toHaveBeenCalledWith(task.id);
+    expect(mocks.socketClient.notifyTaskDone).toHaveBeenCalledWith(task.id, undefined);
 
     // Locks released for all target files
     expect(mocks.lockManager.release).toHaveBeenCalledWith("src/a.ts");
@@ -328,21 +331,21 @@ describe("AgentWorker — lifecycle", () => {
     contextCollectPreHints.mockResolvedValue({
       hints: [
         {
-          source: "git",
+          source: "typescript",
           priority: "high",
           title: "Warning: shared module modified!",
           content: "Warning: shared module modified by agent-2",
           timestamp: Date.now(),
         },
         {
-          source: "git",
+          source: "eslint",
           priority: "medium",
           title: "Agent activity: 1 active in same module",
           content: "Active locks: src/utils.ts by agent-2",
           timestamp: Date.now(),
         },
       ],
-      preStates: new Map([["git", {}]]),
+      preStates: new Map([["typescript", {}]]),
     });
 
     let capturedHints: string[] = [];

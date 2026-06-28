@@ -94,42 +94,36 @@ export class GitProvider implements ContextProvider {
   }
 
   /**
-   * Show git blame for the first 20 lines of each target file.
-   * Capped at 2000 characters total to avoid token bloat.
+   * Show git blame for the first 10 lines of the first target file.
+   * Capped at 500 characters to minimize token waste.
    */
   private gitBlame(
     worktreePath: string,
     task: Task
   ): ContextHint | null {
     try {
-      const blames: string[] = [];
-      for (const file of task.target_files.slice(0, 3)) {
-        const absPath = path.join(worktreePath, file);
-        if (!fs.existsSync(absPath)) continue;
+      const file = task.target_files[0];
+      const absPath = path.join(worktreePath, file);
+      if (!fs.existsSync(absPath)) return null;
 
-        const blame = execSync(
-          `git blame -w --date=short ${file} 2>/dev/null | head -20`,
-          {
-            cwd: worktreePath,
-            stdio: "pipe",
-            timeout: 5000,
-            encoding: "utf-8",
-          }
-        ).trim();
-
-        if (blame) {
-          blames.push(`--- ${file} ---\n${blame}`);
+      const blame = execSync(
+        `git blame -w --date=short ${file} 2>/dev/null | head -10`,
+        {
+          cwd: worktreePath,
+          stdio: "pipe",
+          timeout: 5000,
+          encoding: "utf-8",
         }
-      }
+      ).trim();
 
-      if (blames.length === 0) return null;
+      if (!blame) return null;
 
-      const content = `[GIT BLAME]\n${blames.join("\n\n")}`;
+      const content = `[GIT BLAME] ${file}:\n${blame}`;
       return {
         source: this.name,
         priority: "low",
-        title: `Git blame for ${blames.length} file(s)`,
-        content: content.slice(0, 2000),
+        title: `Git blame for ${file}`,
+        content: content.slice(0, 500),
         timestamp: Date.now(),
       };
     } catch {

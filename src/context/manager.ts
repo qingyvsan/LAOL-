@@ -121,17 +121,29 @@ export class ContextManager {
     for (const result of results) {
       hints.push(...result.hints);
       if (result.preState) {
-        preStates.set(result.providerName, result.preState);
+        // Tag with _clean if no high-priority issues were found.
+        // collectPostHints uses this to skip re-running tools that
+        // were already clean (avoids redundant tsc/eslint/test runs).
+        const hasIssues = result.hints.some((h) => h.priority === "high");
+        preStates.set(result.providerName, {
+          ...result.preState,
+          _clean: !hasIssues,
+        });
       }
     }
 
+    // Deduplicate: remove hints with overlapping content from different providers.
+    // TypeScript and ESLint may both report the same code issue; keep the first
+    // (higher priority) and skip near-duplicates.
+    const dedupedHints = this.deduplicateHints(hints);
+
     // Sort: high priority first
-    hints.sort((a, b) => {
+    dedupedHints.sort((a, b) => {
       const order = { high: 0, medium: 1, low: 2 };
       return order[a.priority] - order[b.priority];
     });
 
-    return { hints, preStates };
+    return { hints: dedupedHints, preStates };
   }
 
   /**
@@ -153,10 +165,14 @@ export class ContextManager {
 
     const results = await Promise.all(
       [...preStates.entries()]
-        .filter(([providerName]) => {
+        .filter(([providerName, preState]) => {
           // Skip providers with post_task_enabled explicitly set to false
           const providerCfg = this.config.context_providers[providerName];
-          return providerCfg?.post_task_enabled !== false;
+          if (providerCfg?.post_task_enabled === false) return false;
+          // Skip providers that had no issues pre-task (avoid redundant re-runs)
+          const state = preState as Record<string, unknown> | null;
+          if (state?._clean === true) return false;
+          return true;
         })
         .map(async ([providerName, preState]) => {
           const provider = providerMap.get(providerName);
@@ -207,6 +223,44 @@ export class ContextManager {
    */
   getProviderNames(): string[] {
     return this.providers.map((p) => p.name);
+  }
+
+  /**
+   * Remove hints whose content substantially overlaps with another hint
+   * from a different provider. Keeps the hint that appears first (typically
+   * from the first provider to complete) and skips its near-duplicates.
+   *
+   * This prevents TypeScript and ESLint from both reporting the same code
+   * issue in the agent's prompt, wasting context tokens.
+   */
+  private deduplicateHints(hints: ContextHint[]): ContextHint[] {
+    if (hints.length <= 1) return hints;
+
+    const result: ContextHint[] = [];
+
+    for (const hint of hints) {
+      // Check if this hint's content substantially overlaps with any
+      // already-kept hint from a DIFFERENT provider
+      const isDuplicate = result.some((kept) => {
+        if (kept.source === hint.source) return false; // same provider, keep
+
+        // Fast check: same title = likely duplicate
+        if (kept.title === hint.title) return true;
+
+        // Content overlap check: if >60% of lines overlap, treat as duplicate
+        const keptLines = new Set(kept.content.split("\n"));
+        const hintLines = hint.content.split("\n");
+        if (hintLines.length === 0) return false;
+        const overlap = hintLines.filter((l) => keptLines.has(l)).length;
+        return overlap / hintLines.length > 0.6;
+      });
+
+      if (!isDuplicate) {
+        result.push(hint);
+      }
+    }
+
+    return result;
   }
 
   // ---- internal ----

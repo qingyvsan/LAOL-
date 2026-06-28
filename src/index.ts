@@ -35,5 +35,5 @@ export { KnowledgeStore } from "./knowledge/knowledge-store";
 export type { KnowledgeEntry } from "./knowledge/knowledge-store";
 export { InteractiveTerminalOpener } from "./agent/interactive-executor";
 export type { InteractiveResult } from "./data/models";
-export type { InteractiveContext } from "./agent/claude-executor";
+
 export { loadConfig, saveConfig, resolveRepoRoot, DEFAULT_CONFIG } from "./config";

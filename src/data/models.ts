@@ -376,6 +376,30 @@ export interface InteractiveResult {
   durationMs: number;
 }
 
+// ---- ChangeJournal types ----
+
+export type ChangeType = "file" | "index" | "knowledge" | "merge";
+
+export interface ChangeEntry {
+  id: string;
+  type: ChangeType;
+  timestamp: number;
+  agent_id?: string;
+  file?: string;
+  files?: string[];
+  task_id?: string;
+  summary?: string;
+  worktree?: string;
+}
+
+export interface ChangeQueryFilter {
+  type?: ChangeType | "all";
+  files?: string[];
+  since?: number;
+  agentId?: string;
+  limit?: number;
+}
+
 export interface LaolConfig {
   scheduler: {
     port: number;

@@ -202,41 +202,32 @@ export class InteractiveTerminalOpener {
 
   // ---- Private: CLAUDE.md content ----
 
+  /**
+   * Build a compact CLAUDE.md for interactive sessions.
+   *
+   * In interactive mode there is NO stdin prompt — Claude Code reads CLAUDE.md
+   * on startup. Must include the task description and target files.
+   *
+   * Context provider output (tsc, eslint, tests, etc.) is written to
+   * `.multiagent/diagnostics.md` — kept separate to avoid bloating CLAUDE.md,
+   * but still available when Claude needs diagnostic information.
+   */
   private buildClaudeMd(
     task: Task,
-    contextHints: string[],
+    _contextHints: string[],
     readOnly = false
   ): string {
     const lines: string[] = [];
 
-    // Header
-    lines.push("# LAOL Agent Task");
+    lines.push("# LAOL Agent Session");
     lines.push("");
 
     // Role
-    lines.push("## Role");
     if (readOnly) {
-      lines.push(
-        "You are an AI analysis agent in the LAOL multi-agent collaboration system."
-      );
-      lines.push(
-        "This is a **READ-ONLY** task — you must NOT modify any files."
-      );
-      lines.push(
-        "Your entire response will be saved as a report and shown to the user."
-      );
+      lines.push("You are a read-only analysis agent in LAOL. Do NOT modify any files.");
     } else {
-      lines.push(
-        "You are an AI coding agent in the LAOL multi-agent collaboration system."
-      );
-      lines.push(
-        "You are working in an isolated git worktree on branch `agent/" +
-          task.id +
-          "`."
-      );
-      lines.push(
-        "Your changes will be committed and merged automatically after you finish."
-      );
+      lines.push("You are a coding agent in LAOL, working on branch `agent/" + task.id + "`.");
+      lines.push("Your changes will be committed and merged automatically.");
     }
     lines.push("");
 
@@ -247,85 +238,25 @@ export class InteractiveTerminalOpener {
 
     // Target files
     if (task.target_files.length > 0) {
-      if (readOnly) {
-        lines.push("## Target Files (for analysis)");
-      } else {
-        lines.push("## Target Files");
-        lines.push("Focus your changes on these files:");
-      }
+      lines.push(readOnly ? "## Files to Analyze" : "## Target Files");
       for (const f of task.target_files) {
         lines.push(`- \`${f}\``);
       }
       lines.push("");
-    } else {
-      lines.push("## Exploration First");
-      lines.push(
-        "No target files were pre-specified. You must first explore the"
-      );
-      lines.push(
-        "codebase to determine which files need to be modified, then proceed"
-      );
-      lines.push("with the implementation.");
-      lines.push("");
     }
 
-    // Context hints
-    if (contextHints.length > 0) {
-      lines.push("## Context & Warnings");
-      for (const hint of contextHints) {
-        lines.push(`- ${hint}`);
-      }
-      lines.push("");
-    }
-
-    // Instructions
-    lines.push("## Instructions");
-    if (readOnly) {
-      lines.push("1. Read and explore the relevant files to understand the code");
-      lines.push("2. Analyze based on the task description");
-      lines.push(
-        "3. Report your findings clearly and comprehensively as markdown"
-      );
-      lines.push("4. **Do NOT modify any files** — this is a read-only analysis");
-      lines.push(
-        "5. When you are done, type `/exit` or press Ctrl+D to finish"
-      );
-    } else {
-      lines.push(
-        "1. Read the target files to understand the current code"
-      );
-      lines.push("2. Implement the changes described in the Task section");
-      lines.push(
-        "3. Verify your changes compile and are correct — run build and tests"
-      );
-      lines.push(
-        "4. Keep changes minimal and focused — only modify what the task requires"
-      );
-      lines.push(
-        "5. When you are done, type `/exit` or press Ctrl+D to finish"
-      );
-    }
+    // Coordination pointers
+    lines.push("## Coordination");
+    lines.push("- **Diagnostics (tsc, lint, tests)**: `.multiagent/diagnostics.md`");
+    lines.push("- **File changes / merges**: `.multiagent/journal/latest-changes.md`");
+    lines.push("- **Knowledge / learnings**: `.multiagent/notifications.md`");
     lines.push("");
 
-    // Test/build hints
-    if (!readOnly) {
-      const pkgJsonPath = path.join(this.repoRoot, "package.json");
-      if (fs.existsSync(pkgJsonPath)) {
-        try {
-          const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
-          if (pkg.scripts?.test) {
-            lines.push("## Available Commands");
-            lines.push("```");
-            if (pkg.scripts.test) lines.push(`npm test    — ${pkg.scripts.test}`);
-            if (pkg.scripts.build) lines.push(`npm run build — ${pkg.scripts.build}`);
-            if (pkg.scripts.lint) lines.push(`npm run lint — ${pkg.scripts.lint}`);
-            lines.push("```");
-            lines.push("");
-          }
-        } catch {
-          // ignore
-        }
-      }
+    // Brief instructions
+    if (readOnly) {
+      lines.push("Analyze the files above and report your findings. Do NOT modify any files.");
+    } else {
+      lines.push("Implement the task. Run build/tests to verify. Type `/exit` when done.");
     }
 
     return lines.join("\n");
