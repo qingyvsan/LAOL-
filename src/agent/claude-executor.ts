@@ -396,6 +396,21 @@ export class ClaudeCodeExecutor {
 
   // ---- Prompt building ----
 
+  /**
+   * Read package.json scripts from the worktree.
+   * Shared by buildPrompt() and buildClaudeMdPrompt().
+   */
+  private getPackageScripts(worktreePath: string): Record<string, string> | null {
+    const pkgJsonPath = path.join(worktreePath, "package.json");
+    if (!fs.existsSync(pkgJsonPath)) return null;
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
+      return pkg.scripts || null;
+    } catch {
+      return null;
+    }
+  }
+
   private buildPrompt(
     worktreePath: string,
     task: Task,
@@ -464,23 +479,16 @@ export class ClaudeCodeExecutor {
 
     // If there are test commands in the project, hint at running them
     if (!readOnly) {
-      const pkgJsonPath = path.join(worktreePath, "package.json");
-      if (fs.existsSync(pkgJsonPath)) {
-        try {
-          const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
-          if (pkg.scripts?.test) {
-            lines.push("Run tests to verify your changes:");
-            lines.push(`  npm test`);
-            lines.push("");
-          }
-          if (pkg.scripts?.build) {
-            lines.push("Verify the build passes:");
-            lines.push(`  npm run build`);
-            lines.push("");
-          }
-        } catch {
-          // ignore — package.json may be malformed
-        }
+      const scripts = this.getPackageScripts(worktreePath);
+      if (scripts?.test) {
+        lines.push("Run tests to verify your changes:");
+        lines.push("  npm test");
+        lines.push("");
+      }
+      if (scripts?.build) {
+        lines.push("Verify the build passes:");
+        lines.push("  npm run build");
+        lines.push("");
       }
     }
 
@@ -636,22 +644,15 @@ export class ClaudeCodeExecutor {
 
     // Test/build hints
     if (!readOnly) {
-      const pkgJsonPath = path.join(worktreePath, "package.json");
-      if (fs.existsSync(pkgJsonPath)) {
-        try {
-          const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
-          if (pkg.scripts?.test || pkg.scripts?.build) {
-            lines.push("## Available Commands");
-            lines.push("```");
-            if (pkg.scripts.test) lines.push(`npm test      — ${pkg.scripts.test}`);
-            if (pkg.scripts.build) lines.push(`npm run build — ${pkg.scripts.build}`);
-            if (pkg.scripts.lint) lines.push(`npm run lint  — ${pkg.scripts.lint}`);
-            lines.push("```");
-            lines.push("");
-          }
-        } catch {
-          // ignore
-        }
+      const scripts = this.getPackageScripts(worktreePath);
+      if (scripts && (scripts.test || scripts.build || scripts.lint)) {
+        lines.push("## Available Commands");
+        lines.push("```");
+        if (scripts.test) lines.push(`npm test      — ${scripts.test}`);
+        if (scripts.build) lines.push(`npm run build — ${scripts.build}`);
+        if (scripts.lint) lines.push(`npm run lint  — ${scripts.lint}`);
+        lines.push("```");
+        lines.push("");
       }
     }
 

@@ -34,6 +34,7 @@ export const DEFAULT_CONFIG: LaolConfig = {
       poll_interval_ms: 2000,
       session_dir: "sessions",
     },
+    worktree_pool_size: 1,
   },
   locks: {
     initial_ttl_ms: 60000,
@@ -87,6 +88,7 @@ export const DEFAULT_CONFIG: LaolConfig = {
         test_patterns: ["**/*.test.ts", "**/*.spec.ts", "**/*.test.tsx", "**/*.spec.tsx"],
         file_to_test_mapping: "convention",
       },
+      post_task_enabled: false,
     },
     git: {
       enabled: true,

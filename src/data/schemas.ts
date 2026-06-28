@@ -219,6 +219,7 @@ export const LaolConfigSchema = z.object({
       session_dir: z.string().default("sessions"),
       terminal_cmd: z.string().optional(),
     }).optional(),
+    worktree_pool_size: z.number().int().min(1).max(16).optional(),
   }),
   locks: z.object({
     initial_ttl_ms: z.number().int().min(10000).default(60000),
@@ -242,6 +243,7 @@ export const LaolConfigSchema = z.object({
       include: z.array(z.string()).optional(),
       timeout_seconds: z.number().int().min(1).max(600),
       options: z.record(z.unknown()).optional(),
+      post_task_enabled: z.boolean().optional(),
     })
   ).default({}),
 });

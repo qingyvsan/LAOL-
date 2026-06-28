@@ -21,7 +21,7 @@ export class PythonProvider implements ContextProvider {
 
   private config: ContextProviderConfig;
 
-  constructor(config: ContextProviderConfig) {
+  constructor(config: ContextProviderConfig, _repoRoot?: string) {
     this.config = config;
   }
 

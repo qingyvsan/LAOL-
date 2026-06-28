@@ -70,6 +70,36 @@ export class KnowledgeStore {
   }
 
   /**
+   * Look up a single knowledge entry by task ID (O(1) direct read).
+   * Returns null if no entry exists for the given task.
+   */
+  getByTaskId(taskId: string): KnowledgeEntry | null {
+    const filePath = path.join(this.knowledgeDir, `${taskId}.json`);
+    if (!fs.existsSync(filePath)) return null;
+    try {
+      const raw = fs.readFileSync(filePath, "utf-8");
+      const entry = JSON.parse(raw) as KnowledgeEntry;
+      if (entry.task_id === taskId && entry.summary) return entry;
+    } catch {
+      // corrupt file
+    }
+    return null;
+  }
+
+  /**
+   * Save a post-task delta entry without overwriting the main knowledge
+   * entry for the same task. Uses a distinct filename suffix so both the
+   * Claude stdout summary AND the provider delta info are preserved.
+   */
+  saveDelta(entry: KnowledgeEntry): void {
+    if (!fs.existsSync(this.knowledgeDir)) {
+      fs.mkdirSync(this.knowledgeDir, { recursive: true });
+    }
+    const filePath = path.join(this.knowledgeDir, `${entry.task_id}_delta.json`);
+    fs.writeFileSync(filePath, JSON.stringify(entry, null, 2), "utf-8");
+  }
+
+  /**
    * Find knowledge entries relevant to a set of files or a text query.
    * Simple substring matching for now — scalable to embeddings later.
    */

@@ -285,6 +285,8 @@ export interface ContextProviderConfig {
   timeout_seconds: number;
   /** Provider-specific options (e.g. test runner binary path). */
   options?: Record<string, unknown>;
+  /** Whether to run deactivate() after the task to compute before/after deltas. Default: true. */
+  post_task_enabled?: boolean;
 }
 
 /**
@@ -390,6 +392,8 @@ export interface LaolConfig {
     mode: "piped" | "interactive";
     /** Configuration for interactive terminal mode. */
     interactive?: InteractiveAgentConfig;
+    /** Per-agent worktree pool size. Falls back to scheduler.pool_size if not set. */
+    worktree_pool_size?: number;
   };
   locks: {
     initial_ttl_ms: number;

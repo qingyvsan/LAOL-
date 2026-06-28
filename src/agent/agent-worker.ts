@@ -221,7 +221,7 @@ export class AgentWorker {
       );
       // Write deltas to knowledge store for other agents
       if (deltas.length > 0) {
-        this.knowledgeStore.save({
+        this.knowledgeStore.saveDelta({
           task_id: taskId,
           agent_id: this.agentId,
           description: `Post-task provider deltas for task ${taskId.slice(0, 8)}`,
@@ -577,9 +577,7 @@ export class AgentWorker {
     const depTask = this.taskStore.getTask(task.dependency);
     if (!depTask) return null;
 
-    const depKnowledge = this.knowledgeStore
-      .loadAll()
-      .filter((k) => k.task_id === task.dependency);
+    const depKnowledge = this.knowledgeStore.getByTaskId(task.dependency);
 
     const lines: string[] = [];
     lines.push(`[PREDECESSOR] This task continues from Task ${task.dependency.slice(0, 8)}`);
@@ -589,8 +587,8 @@ export class AgentWorker {
     lines.push(`  Your worktree already contains all code changes from the predecessor.`);
     lines.push(`  Build on top of it — do NOT re-implement or revert existing changes.`);
 
-    if (depKnowledge.length > 0 && depKnowledge[0].summary) {
-      lines.push(`  Summary: ${depKnowledge[0].summary.slice(0, 300)}`);
+    if (depKnowledge?.summary) {
+      lines.push(`  Summary: ${depKnowledge.summary.slice(0, 300)}`);
     }
 
     return lines.join("\n");

@@ -23,7 +23,7 @@ import type {
  */
 const PROVIDER_REGISTRY: Record<
   string,
-  new (config: ContextProviderConfig) => ContextProvider
+  new (config: ContextProviderConfig, repoRoot?: string) => ContextProvider
 > = {
   typescript: TypeScriptProvider,
   eslint: ESLintProvider,
@@ -47,12 +47,13 @@ const PROVIDER_REGISTRY: Record<
  */
 export class ContextManager {
   private repoRoot: string;
+  private config: LaolConfig;
   private providers: ContextProvider[];
 
   constructor(repoRoot: string, config?: LaolConfig) {
     this.repoRoot = repoRoot;
-    const cfg = config ?? loadConfig(repoRoot);
-    this.providers = this.instantiateProviders(cfg);
+    this.config = config ?? loadConfig(repoRoot);
+    this.providers = this.instantiateProviders(this.config);
   }
 
   /**
@@ -151,9 +152,15 @@ export class ContextManager {
     );
 
     const results = await Promise.all(
-      [...preStates.entries()].map(async ([providerName, preState]) => {
-        const provider = providerMap.get(providerName);
-        if (!provider?.deactivate) return null;
+      [...preStates.entries()]
+        .filter(([providerName]) => {
+          // Skip providers with post_task_enabled explicitly set to false
+          const providerCfg = this.config.context_providers[providerName];
+          return providerCfg?.post_task_enabled !== false;
+        })
+        .map(async ([providerName, preState]) => {
+          const provider = providerMap.get(providerName);
+          if (!provider?.deactivate) return null;
 
         try {
           return await provider.deactivate(worktreePath, task, preState);
@@ -220,7 +227,7 @@ export class ContextManager {
       }
 
       try {
-        providers.push(new Ctor(providerCfg));
+        providers.push(new Ctor(providerCfg, this.repoRoot));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.error(

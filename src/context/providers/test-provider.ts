@@ -20,7 +20,10 @@ export class TestProvider implements ContextProvider {
 
   private config: ContextProviderConfig;
 
-  constructor(config: ContextProviderConfig) {
+  /** Stored by activate() so deactivate() can compute an accurate delta. */
+  private lastTestResult: { totalPassed: number; totalFailed: number; testFiles: string[]; failedFiles: string[] } | null = null;
+
+  constructor(config: ContextProviderConfig, _repoRoot?: string) {
     this.config = config;
   }
 
@@ -60,6 +63,7 @@ export class TestProvider implements ContextProvider {
     }
 
     if (hints.length === 0) {
+      this.lastTestResult = null;
       hints.push({
         source: this.name,
         priority: "low",
@@ -68,7 +72,33 @@ export class TestProvider implements ContextProvider {
           "[TEST] No test files found for the target files by naming convention.",
         timestamp: Date.now(),
       });
+      return hints;
     }
+
+    // Store pass/fail counts so deactivate() can compute an accurate delta
+    // without re-running all tests.
+    let totalPassed = 0;
+    let totalFailed = 0;
+    const allTestFiles: string[] = [];
+    const failedFiles: string[] = [];
+
+    for (const h of hints) {
+      const match = h.title.match(/(\d+) passed, (\d+) failed/);
+      if (match) {
+        totalPassed += parseInt(match[1], 10);
+        totalFailed += parseInt(match[2], 10);
+      }
+      // Extract failing test file paths from the content
+      const failSection = h.content.match(/Failing tests:\n([\s\S]*?)$/);
+      if (failSection) {
+        for (const line of failSection[1].split("\n")) {
+          const fileMatch = line.match(/-\s+(.+?)(?:\s|$)/);
+          if (fileMatch) failedFiles.push(fileMatch[1].trim());
+        }
+      }
+    }
+
+    this.lastTestResult = { totalPassed, totalFailed, testFiles: allTestFiles, failedFiles };
 
     return hints;
   }
@@ -172,38 +202,81 @@ export class TestProvider implements ContextProvider {
   async deactivate(
     worktreePath: string,
     task: Task,
-    preState: unknown
+    _preState: unknown
   ): Promise<{ hints: ContextHint[]; delta: ProviderDelta | null }> {
-    // Simplified: just re-run via activate and compare totals.
-    // The detailed per-language deactivation is handled in activate's
-    // preState payload which the ContextManager passes through.
-    const postHints = await this.activate(worktreePath, task);
-    const preData = preState as { totalPassed: number; totalFailed: number } | null;
+    const preResult = this.lastTestResult;
+    if (!preResult) return { hints: [], delta: null };
 
-    if (!preData) return { hints: [], delta: null };
+    // All tests passed before — skip re-run to save time.
+    // The agent may have introduced new failures, but detecting them
+    // would require a full re-run which we intentionally avoid.
+    if (preResult.totalFailed === 0) {
+      return {
+        hints: [],
+        delta: {
+          source: this.name,
+          before: { errors: 0, warnings: 0 },
+          after: { errors: 0, warnings: 0 },
+          fixed: [],
+          introduced: [],
+        },
+      };
+    }
 
-    // Count totals from post-hints
-    let postPassed = 0;
-    let postFailed = 0;
-    for (const h of postHints) {
-      const tsMatch = h.title.match(/(\d+) passed, (\d+) failed/);
-      if (tsMatch) {
-        postPassed += parseInt(tsMatch[1], 10);
-        postFailed += parseInt(tsMatch[2], 10);
+    // Only re-run previously failing test files to check if they're now fixed.
+    // This avoids re-running the entire test suite.
+    let postFailed = preResult.totalFailed;
+    let fixed = 0;
+
+    if (preResult.failedFiles.length > 0) {
+      const tsFailed = preResult.failedFiles.filter((f) => /\.test\.(ts|tsx)$|\.spec\.(ts|tsx)$/.test(f));
+      const pyFailed = preResult.failedFiles.filter((f) => /\.py$/.test(f));
+
+      try {
+        if (tsFailed.length > 0) {
+          const runner = this.detectTSRunner(worktreePath);
+          if (runner) {
+            const output = execSync(
+              `npx ${runner} run ${tsFailed.join(" ")} --reporter=verbose --passWithNoTests`,
+              { cwd: worktreePath, stdio: "pipe", timeout: this.config.timeout_seconds * 1000, encoding: "utf-8" }
+            );
+            const summary = this.parseSummary(output);
+            fixed += Math.max(0, tsFailed.length - summary.failed);
+            postFailed = postFailed - preResult.totalFailed + summary.failed;
+          }
+        }
+        if (pyFailed.length > 0) {
+          const runnerCmd = this.detectPythonRunner(worktreePath);
+          if (runnerCmd) {
+            const output = execSync(
+              `${runnerCmd} ${pyFailed.join(" ")} -q --tb=short`,
+              { cwd: worktreePath, stdio: "pipe", timeout: this.config.timeout_seconds * 1000, encoding: "utf-8" }
+            );
+            const summary = this.parsePytestSummary(output);
+            fixed += Math.max(0, pyFailed.length - summary.failed);
+            postFailed = postFailed - preResult.totalFailed + summary.failed;
+          }
+        }
+      } catch (err: unknown) {
+        const stdout = (err as { stdout?: Buffer })?.stdout?.toString("utf-8") ?? "";
+        const stderr = (err as { stderr?: Buffer })?.stderr?.toString("utf-8") ?? "";
+        const combined = stdout + "\n" + stderr;
+        // Try to extract postFailed from the error output
+        const tsSummary = this.parseSummary(combined);
+        const pySummary = this.parsePytestSummary(combined);
+        postFailed = tsSummary.failed + pySummary.failed;
+        fixed = Math.max(0, preResult.totalFailed - postFailed);
       }
     }
 
     const delta: ProviderDelta = {
       source: this.name,
-      before: { errors: preData.totalFailed, warnings: 0 },
+      before: { errors: preResult.totalFailed, warnings: 0 },
       after: { errors: postFailed, warnings: 0 },
-      fixed:
-        preData.totalFailed > postFailed
-          ? [`Fixed ${preData.totalFailed - postFailed} failing test(s)`]
-          : [],
+      fixed: fixed > 0 ? [`Fixed ${fixed} failing test(s)`] : [],
       introduced:
-        postFailed > preData.totalFailed
-          ? [`${postFailed - preData.totalFailed} new test failure(s)`]
+        postFailed > preResult.totalFailed
+          ? [`${postFailed - preResult.totalFailed} new test failure(s)`]
           : [],
     };
 

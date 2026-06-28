@@ -66,7 +66,7 @@ export class AgentRunner {
     this.taskStore = new TaskStore(repoRoot);
     this.lockManager = new LockManager(repoRoot);
     this.leaseManager = new LeaseManager(this.lockManager);
-    this.worktreePool = new WorktreePool(repoRoot, this.config.scheduler.pool_size);
+    this.worktreePool = new WorktreePool(repoRoot, this.config.agent.worktree_pool_size ?? this.config.scheduler.pool_size);
     this.registryManager = new RegistryManager(repoRoot);
     this.knowledgeStore = new KnowledgeStore(repoRoot);
     this.claudeExecutor = new ClaudeCodeExecutor(this.config.claude_executor);

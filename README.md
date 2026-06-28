@@ -7,15 +7,18 @@ LAOL lets multiple Claude Code AI agents safely modify the same codebase **in pa
 ## Architecture
 
 ```
-                           ┌──────────────────────┐
-                           │   .multiagent/        │
-                           │   ├── tasks/          │  ← User drops task JSON
-                           │   ├── locks/          │  ← Atomic file locks
-                           │   ├── staging/        │  ← Two-phase commit
-                           │   ├── wal/            │  ← Crash recovery log
-                           │   ├── warnings/       │  ← Semantic conflict alerts
-                           │   └── config.json     │
-                           └──────┬───────────────┘
+                           ┌──────────────────────────┐
+                           │   .multiagent/            │
+                           │   ├── tasks/              │  ← User drops task JSON
+                           │   ├── locks/              │  ← Atomic file locks
+                           │   ├── staging/            │  ← Two-phase commit
+                           │   ├── wal/                │  ← Crash recovery log
+                           │   ├── knowledge/          │  ← Shared agent memory
+                           │   ├── cache/tsc/          │  ← TSC result cache
+                           │   ├── reports/            │  ← Read-only task reports
+                           │   ├── sessions/           │  ← Interactive session state
+                           │   └── config.json         │
+                           └──────┬───────────────────┘
                                   │
                     ┌─────────────┴─────────────┐
                     │     Scheduler (TCP:9123)   │
@@ -34,9 +37,18 @@ LAOL lets multiple Claude Code AI agents safely modify the same codebase **in pa
     │  ┌──────────────┐ │               │  ┌──────────────┐ │
     │  │ Worktree A   │ │               │  │ Worktree B   │ │
     │  │ (isolated)   │ │               │  │ (isolated)   │ │
-    │  │ Claude Code │ │               │  │ Claude Code │ │
+    │  │ Claude Code  │ │               │  │ Claude Code  │ │
+    │  └──────────────┘ │               │  └──────────────┘ │
+    │  ┌──────────────┐ │               │  ┌──────────────┐ │
+    │  │ Knowledge    │ │               │  │ Knowledge    │ │
+    │  │ Store        │ │               │  │ Store        │ │
     │  └──────────────┘ │               │  └──────────────┘ │
     └──────────────────┘               └──────────────────┘
+              │                                   │
+              │     ┌──────────────────────┐      │
+              └─────│   Shared TSC Cache    │──────┘
+                    │   (tree-hash keyed)   │
+                    └──────────────────────┘
               │                                   │
               └──────────┬────────────────────────┘
                          ▼
@@ -60,9 +72,9 @@ LAOL features a **live context injection pipeline** that runs real toolchains be
 
 | Provider | What it does |
 |----------|-------------|
-| **TypeScriptProvider** | Runs `tsc --noEmit`, filters errors to target files (cap 15) |
+| **TypeScriptProvider** | Runs `tsc --noEmit`, filters errors to target files (cap 15). Results cached by git tree hash — agents sharing the same base commit reuse a single tsc run. |
 | **ESLintProvider** | Runs `eslint --format compact` on target TS files (cap 10) |
-| **TestProvider** | Runs related tests via vitest/jest/pytest and injects pass/fail baseline |
+| **TestProvider** | Runs related tests via vitest/jest/pytest and injects pass/fail baseline. Post-task only re-runs previously failing tests, not the full suite. |
 | **GitProvider** | Git blame, recent commits, and active agent activity in overlapping modules |
 | **PythonProvider** | Runs `ruff check` + `mypy` with graceful degradation if tools absent |
 | **CodebaseProvider** | Queries the symbol index for target file structure (functions, classes, exports) |
@@ -70,7 +82,19 @@ LAOL features a **live context injection pipeline** that runs real toolchains be
 
 After the task, providers with `deactivate()` re-run to compute **before/after deltas** (errors fixed, new failures introduced), stored in the KnowledgeStore for other agents.
 
-**Token impact:** Pre-computed diagnostics reduce agent-initiated tool calls by an estimated **55-65%** — from ~2,500–8,700 tokens down to ~1,000–3,100 per task.
+**Token impact:** Pre-computed diagnostics reduce agent-initiated tool calls by an estimated **55-65%** — from ~2,500-8,700 tokens down to ~1,000-3,100 per task.
+
+## Knowledge Sharing
+
+LAOL maintains a **shared agent memory** at `.multiagent/knowledge/`. When agents complete exploration or modification tasks, they record what they learned — which files were explored, what was discovered, and a human-readable summary.
+
+Before starting work, each agent queries the knowledge store for:
+
+- **Predecessor context** — What did the dependency task do? What files did it touch?
+- **Relevant discoveries** — Have other agents already explored files in the same module?
+- **Provider deltas** — What lint/type errors did the previous agent fix or introduce?
+
+This prevents agents from re-exploring the same code or repeating known mistakes. The store uses the file system directly — one JSON file per task — with O(1) lookups by task ID.
 
 ## Codebase Indexer
 
@@ -99,18 +123,29 @@ The index is stored at `.multiagent/codebase-index.json` and supports incrementa
 | Import map | `import { User } from "./models"` |
 | Call graph (outgoing) | `AuthService.login` calls `validatePassword`, `createSession` |
 
+## Performance Optimizations
+
+LAOL includes several optimizations to avoid redundant computation across agents:
+
+| Optimization | What it does |
+|-------------|-------------|
+| **TSC result cache** | Full-project `tsc --noEmit` results are cached by git tree hash. Two agents working from the same base commit share one tsc run instead of each running it independently. Cache stored at `.multiagent/cache/tsc/`. |
+| **Incremental test re-run** | Post-task, only previously failing test files are re-run — not the full test suite. If all tests passed before, no re-run is needed. |
+| **Per-provider post-task control** | Each context provider supports `post_task_enabled: false` to skip expensive post-task re-runs. Default: test provider skips post-task (the most expensive re-run). |
+| **Per-agent worktree pool** | Each agent defaults to 1 worktree (`agent.worktree_pool_size: 1`) instead of sharing the scheduler's pool size, reducing initialization overhead. |
+
 ## How It Prevents Conflicts
 
 | Mechanism | What it does |
 |-----------|-------------|
-| **Two-Phase Commit Lock** | All target files locked atomically via `staging/` → `locks/` rename. If any file is taken, the entire batch rolls back — no partial lock sets. |
+| **Two-Phase Commit Lock** | All target files locked atomically via `staging/` -> `locks/` rename. If any file is taken, the entire batch rolls back — no partial lock sets. |
 | **Dynamic Lock Expansion** | Agents request locks on-demand during execution via TCP. Discovered a new dependency mid-task? Request a lock — granted or denied in real time. |
 | **Conflict Pre-Check** | Before assigning a task, the scheduler checks whether any target file is already locked. Blocked tasks stay `pending`. |
 | **Auto-Discovery** | No `--files`? No problem. Agents explore the codebase, identify target files, request locks, then proceed — all automatically. |
 | **Graded TTL Leases** | New locks: 60s TTL. After 2 successful renewals: 180s TTL. If an agent crashes, locks auto-expire within 90s (not 300s). |
 | **Context Provider Pipeline** | Before each task, 7 live providers (tsc, eslint, vitest, git, etc.) inject diagnostics into the agent prompt. After the task, providers compute deltas so the next agent knows what changed. |
-| **Agent Circuit Breaker** | 2 consecutive failures → degraded (simple tasks only). 5 → quarantined (no tasks). Prevents broken agents from burning API costs. |
-| **Task Dependency Chains** | When Task B depends on Task A, B's worktree starts from A's branch — inheriting all code changes. Agents receive `[PREDECESSOR]` context hints describing what A did. Chain of any length: A → B → C works naturally. |
+| **Agent Circuit Breaker** | 2 consecutive failures -> degraded (simple tasks only). 5 -> quarantined (no tasks). Prevents broken agents from burning API costs. |
+| **Task Dependency Chains** | When Task B depends on Task A, B's worktree starts from A's branch — inheriting all code changes. Agents receive `[PREDECESSOR]` context hints describing what A did. Chain of any length: A -> B -> C works naturally. |
 
 ## Key Design Decisions
 
@@ -119,6 +154,7 @@ The index is stored at `.multiagent/codebase-index.json` and supports incrementa
 - **Optimistic concurrency for tasks** (version numbers), **pessimistic locking for files** (exclusive leases).
 - **Claude Code in interactive terminals** — agents open full interactive Claude Code sessions in new terminal windows. All CLI features (MCP, hooks, skills, slash commands, plan mode) are preserved. LAOL manages task coordination, lock leases, and worktree lifecycle; Claude does the coding with full user control.
 - **Live toolchain queries, not static parsing** — context providers run real compilers, linters, and test runners instead of relying solely on AST indexing. Inspired by the fennara-godot-ai live-editor-query architecture.
+- **Shared agent memory** — Knowledge entries from completed tasks are stored on disk and queried by other agents before starting work, preventing duplicate exploration and providing predecessor context for dependency chains.
 
 ## Installation
 
@@ -278,7 +314,7 @@ Show system overview: task counts, lock count, pool usage.
 {
   "scheduler": {
     "port": 9123,           // TCP port for agent connections
-    "pool_size": 4          // Pre-warmed worktree count
+    "pool_size": 4          // Pre-warmed worktree count (shared pool)
   },
   "merge_checks": [          // Pre-merge CI validation
     { "name": "type-check", "cmd": "npx tsc --noEmit", "timeout": 60 },
@@ -286,7 +322,7 @@ Show system overview: task counts, lock count, pool usage.
   ],
   "merge_driver": "ai-merge",
   "merge_driver_config": {
-    "same_function_strategy": "always_llm",  // Same-function conflicts → LLM merge
+    "same_function_strategy": "always_llm",  // Same-function conflicts -> LLM merge
     "cache_size": 100,
     "cache_ttl": 300,
     "quorum_enabled": false                   // Enable dual-model quorum merge
@@ -300,7 +336,8 @@ Show system overview: task counts, lock count, pool usage.
   "agent": {
     "heartbeat_interval_ms": 25000,
     "checkpoint_min_interval_ms": 30000,
-    "mode": "interactive",       // "piped" for headless, "interactive" for full CLI experience
+    "worktree_pool_size": 1,   // Worktrees per agent (default 1; each agent only needs one)
+    "mode": "interactive",     // "piped" for headless, "interactive" for full CLI experience
     "interactive": {
       "terminal_timeout_seconds": 7200,  // Max session duration (2 hours)
       "poll_interval_ms": 2000,          // Sentinel file poll interval
@@ -331,7 +368,7 @@ Show system overview: task counts, lock count, pool usage.
   "context_providers": {
     "typescript": { "enabled": true, "timeout_seconds": 60 },
     "eslint":     { "enabled": true, "timeout_seconds": 30 },
-    "test":       { "enabled": true, "timeout_seconds": 120 },
+    "test":       { "enabled": true, "timeout_seconds": 120, "post_task_enabled": false },
     "git":        { "enabled": true, "timeout_seconds": 10 },
     "python":     { "enabled": true, "timeout_seconds": 60 },
     "codebase":   { "enabled": true, "timeout_seconds": 10 },
@@ -340,10 +377,15 @@ Show system overview: task counts, lock count, pool usage.
 }
 ```
 
+Key config notes:
+- `agent.worktree_pool_size` controls worktrees per agent (default 1). Separate from `scheduler.pool_size`.
+- `context_providers.<name>.post_task_enabled` controls whether a provider re-runs after the task to compute deltas. Set to `false` for expensive providers (test is disabled by default).
+- TSC results are automatically cached at `.multiagent/cache/tsc/` keyed by git tree hash.
+
 ## Task Lifecycle (End to End)
 
 ```
-User drops task JSON → tasks/
+User drops task JSON -> tasks/
     │
     ▼
 chokidar fires "task_created" event
@@ -351,23 +393,23 @@ chokidar fires "task_created" event
     ▼
 Scheduler.runAssignmentLoop()
     ├── ConflictChecker.canAssign(task)
-    │   ├── Are any target files locked? → Block
-    │   ├── Is the dependency task done? → If not, skip
-    │   └── Check registry for semantic warnings → Inject hints
+    │   ├── Are any target files locked? -> Block
+    │   ├── Is the dependency task done? -> If not, skip
+    │   └── Check registry for semantic warnings -> Inject hints
     │
     ├── CircuitBreaker.canAcceptTask(agent, complexity)
-    │   ├── normal    → any task
-    │   ├── degraded  → simple tasks only (≤2 files)
-    │   └── quarantined → no tasks
+    │   ├── normal    -> any task
+    │   ├── degraded  -> simple tasks only (<=2 files)
+    │   └── quarantined -> no tasks
     │
     ├── LockManager.acquire(task_id, agent_id, files)
     │   ├── Write staging/{task_id}.intent
-    │   ├── For each file: write Lock data, renameSync → locks/{file}.lock
+    │   ├── For each file: write Lock data, renameSync -> locks/{file}.lock
     │   └── On any failure: rollback all prior locks
     │
     ├── TaskStore.updateTask(task_id, status: "in_progress")
     │
-    └── SocketServer → notify agent: { event: "task_assigned", task_id }
+    └── SocketServer -> notify agent: { event: "task_assigned", task_id }
             │
             ▼
 AgentRunner.handleTaskAssigned(msg)
@@ -378,22 +420,28 @@ AgentRunner.handleTaskAssigned(msg)
         ├── Checkpoint.checkAndRebase()    # Fetch latest main, rebase if needed
         │
         ├── ContextManager.collectPreHints()   # 7 live providers: tsc, eslint, tests, git, etc.
+        │   ├── TSC results from cache if tree hash matches (shared across agents)
         │   └── Inject [TYPESCRIPT], [ESLINT], [TEST BASELINE], [GIT], [SYMBOLS], etc.
+        │
+        ├── KnowledgeStore.getByTaskId()   # Query predecessor knowledge (O(1) direct read)
+        │   └── Build [PREDECESSOR] hint with dependency task summary
         │
         ├── AgentRunner.createInteractiveExecutor()  # Mode: interactive (default)
         │   ├── Writes CLAUDE.md to worktree root   # Task context injected
         │   ├── InteractiveTerminalOpener opens new terminal window
         │   │   └── Full Claude Code CLI: MCP, hooks, skills, slash commands, plan mode
         │   ├── Polls sentinel file for exit detection
-        │   └── User types /exit or Ctrl+D → terminal closes
+        │   └── User types /exit or Ctrl+D -> terminal closes
         │
         ├── AgentRunner.createPipedExecutor()       # Mode: piped (headless)
-        │   └── spawn("claude", ["-p", prompt, ...])  # Automated execution
+        │   └── spawn("claude", [...])  # Prompt piped via stdin, automated execution
         │       ├── Claude reads target files
         │       ├── Claude makes edits
-        │       └── Claude exits 0 → success
+        │       └── Claude exits 0 -> success
         │
-        ├── ContextManager.collectPostHints()  # Re-run providers, compute before/after deltas
+        ├── ContextManager.collectPostHints()  # Re-run enabled providers, compute deltas
+        │   └── Respects post_task_enabled flag per provider
+        ├── KnowledgeStore.saveDelta()     # Save provider delta (doesn't overwrite main entry)
         ├── git add -A && git commit
         ├── CodebaseIndexer.reindexFiles()     # Keep symbol index fresh (when auto_index: true)
         ├── git push origin agent/{task_id}
@@ -407,7 +455,7 @@ AgentRunner.handleTaskAssigned(msg)
 
 ```bash
 npm install
-npm run build       # TypeScript → dist/
+npm run build       # TypeScript -> dist/
 npm test            # Vitest (269 tests, 20 files)
 npm run dev         # Watch mode
 ```
@@ -422,7 +470,9 @@ src/
 ├── scheduler/       # Event-driven scheduler + conflict checker + circuit breaker + health monitor
 ├── agent/           # Agent worker + heartbeat + checkpoint + interactive/piped executor + Claude executor
 ├── context/         # Context provider pipeline (7 providers: tsc, eslint, test, git, python, codebase, custom)
-│   └── providers/   # Individual provider implementations
+│   ├── providers/   # Individual provider implementations
+│   └── tsc-cache.ts # Shared TSC result cache (tree-hash keyed)
+├── knowledge/       # Shared agent memory — KnowledgeStore (one JSON file per task)
 ├── worktree/        # Git worktree pool
 ├── merge/           # 3-level merge: L1 auto / L2 AST / L3 LLM + sandbox validator
 ├── events/          # EventBus (internal) + TCP socket server/client (cross-platform IPC)
