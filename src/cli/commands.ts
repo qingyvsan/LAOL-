@@ -8,7 +8,7 @@ import { TaskStore } from "../task/task-store";
 import { LockManager } from "../lock/lock-manager";
 import { Scheduler } from "../scheduler/scheduler";
 import { AgentRunner } from "../agent/agent-runner";
-import { loadConfig, saveConfig, resolveRepoRoot, DEFAULT_CONFIG } from "../config";
+import { loadConfig, saveConfig, resolveRepoRoot, ensureGitRepo, DEFAULT_CONFIG } from "../config";
 import { formatTaskTable, formatLockTable, formatAgentTable, formatStatusOverview } from "./formatters";
 import { CodebaseIndexer } from "../codebase/indexer";
 
@@ -57,6 +57,13 @@ program
     const gitignorePath = path.join(multiagentDir, ".gitignore");
     fs.writeFileSync(gitignorePath, "worktrees/\nwal/\nstaging/\ntasks/\nlocks/\n", "utf-8");
     console.log(chalk.green("  created: .multiagent/.gitignore"));
+
+    // Auto-initialize git repo if needed (required for agent operations)
+    const gitResult = ensureGitRepo(root);
+    if (gitResult.error) {
+      console.log(chalk.yellow(`Warning: Could not initialize git repository: ${gitResult.error}`));
+      console.log(chalk.dim("  Agents require a git repository. Please install git and run 'git init' manually."));
+    }
 
     console.log(chalk.bold("\nLAOL initialized successfully."));
     console.log(chalk.dim("\nNext steps:"));
@@ -236,6 +243,14 @@ schedulerCmd
   .action(async (options) => {
     const root = resolveRepoRoot();
 
+    // Ensure git repo exists (required for worktree pool and merge operations)
+    const gitResult = ensureGitRepo(root);
+    if (gitResult.error) {
+      console.log(chalk.red(`Git repository required but could not be initialized: ${gitResult.error}`));
+      console.log(chalk.dim("  Please install git and run 'git init' in the project root."));
+      process.exit(1);
+    }
+
     // Override config with CLI options
     const config = loadConfig(root);
     config.scheduler.port = parseInt(options.port, 10);
@@ -290,6 +305,14 @@ agentCmd
     const root = resolveRepoRoot();
     const isScheduled = options.scheduled === true;
     const mode = options.mode as string | undefined;
+
+    // Ensure git repo exists (required for worktree isolation and task operations)
+    const gitResult = ensureGitRepo(root);
+    if (gitResult.error) {
+      console.log(chalk.red(`Git repository required but could not be initialized: ${gitResult.error}`));
+      console.log(chalk.dim("  Please install git and run 'git init' in the project root."));
+      process.exit(1);
+    }
 
     // Validate mode if provided
     if (mode !== undefined && mode !== "piped" && mode !== "interactive") {

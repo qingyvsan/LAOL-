@@ -348,9 +348,13 @@ export class AgentRunner {
         this.mode === "interactive"
           ? this.createInteractiveExecutor(knowledgeContext)
           : this.createPipedExecutor(knowledgeContext),
-        this.createPipedDiscoveryExecutor(
-          (output) => { discoveryOutput = output; }
-        )
+        // Skip discovery in interactive mode — the user wants an open-ended
+        // session and can explore files themselves inside Claude Code.
+        this.mode === "interactive"
+          ? undefined
+          : this.createPipedDiscoveryExecutor(
+              (output) => { discoveryOutput = output; }
+            )
       );
 
       // Save discovery output as knowledge

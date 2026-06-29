@@ -123,7 +123,7 @@ export class WorktreePool {
       // Fetch may fail if the branch doesn't exist remotely — use local
     }
 
-    // Checkout the base branch and create a new agent branch
+    // Update to the latest base branch commit (worktree is in detached HEAD)
     try {
       execSync(`git checkout -f origin/${baseBranch}`, {
         cwd: wtPath,
@@ -131,12 +131,17 @@ export class WorktreePool {
         timeout: 15_000,
       });
     } catch {
-      // Try local branch as fallback
-      execSync(`git checkout -f ${baseBranch}`, {
-        cwd: wtPath,
-        stdio: "pipe",
-        timeout: 15_000,
-      });
+      // Remote origin may not exist — use local branch ref
+      // Use --detach to avoid "already used by worktree" error
+      try {
+        execSync(`git checkout --detach ${baseBranch}`, {
+          cwd: wtPath,
+          stdio: "pipe",
+          timeout: 15_000,
+        });
+      } catch {
+        // Worktree is already at HEAD — proceed as-is
+      }
     }
 
     execSync(`git checkout -b ${branch}`, {
@@ -220,7 +225,7 @@ export class WorktreePool {
   // ---- Internal ----
 
   private createWorktree(wtPath: string): void {
-    execSync(`git worktree add --no-checkout "${wtPath}" HEAD`, {
+    execSync(`git worktree add --detach "${wtPath}" HEAD`, {
       cwd: this.repoRoot,
       stdio: "pipe",
       timeout: 30_000,

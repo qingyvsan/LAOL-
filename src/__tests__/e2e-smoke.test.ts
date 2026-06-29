@@ -89,9 +89,12 @@ describe("E2E Smoke — full pipeline", () => {
     return {
       notifyTaskDone: vi.fn(),
       notifyTaskFailed: vi.fn(),
+      notifyFilesModified: vi.fn(),
       connect: vi.fn(),
       disconnect: vi.fn(),
       sendHeartbeat: vi.fn(),
+      requestLocksAsync: vi.fn().mockResolvedValue([]),
+      queryChanges: vi.fn().mockResolvedValue([]),
       isConnected: true,
       on: vi.fn(),
       off: vi.fn(),
@@ -166,6 +169,7 @@ describe("E2E Smoke — full pipeline", () => {
     const executor = vi.fn().mockImplementation(async (worktreePath: string) => {
       const filePath = path.join(worktreePath, "src", "auth.ts");
       fs.writeFileSync(filePath, 'export function login() { return "new"; }\n', "utf-8");
+      return { stdout: "Updated auth.ts login function", summary: "Updated auth.ts" };
     });
 
     await worker.executeTask(inProgress!, executor);
@@ -182,7 +186,7 @@ describe("E2E Smoke — full pipeline", () => {
     expect(lockManager.isLocked("src/auth.ts")).toBe(false);
 
     // Scheduler should be notified
-    expect(socketClient.notifyTaskDone).toHaveBeenCalledWith(task.id);
+    expect(socketClient.notifyTaskDone).toHaveBeenCalledWith(task.id, expect.anything());
   });
 
   it("two non-conflicting tasks can both acquire locks", () => {

@@ -182,34 +182,49 @@ export class AgentWorker {
       }
 
       // 6. Discovery phase — if target_files is empty, discover files first
+      // Skip discovery in standalone mode with no target files — the user
+      // wants an open-ended interactive session.
       if (task.target_files.length === 0 && discoveryExecutor) {
         console.log(`[agent ${this.agentId}] Entering discovery phase for task ${taskId.slice(0, 8)}...`);
         const discoveredFiles = await discoveryExecutor(handle.path, task);
 
         if (discoveredFiles.length === 0) {
-          // Read-only task: the exploration itself was the work.
-          // No files need modification — mark done immediately.
-          console.log(`[agent ${this.agentId}] Read-only task — no files to modify.`);
+          // No files discovered. In standalone mode without a socket client,
+          // proceed to the main executor so the user gets an open-ended
+          // interactive session. In scheduled mode, complete as read-only.
+          if (!this.socketClient) {
+            console.log(`[agent ${this.agentId}] No files discovered — opening open-ended session.`);
+            this.activeLockFiles = [];
+            // fall through to main executor below
+          } else {
+            console.log(`[agent ${this.agentId}] Read-only task — no files to modify.`);
+            this.completeReadOnlyTask(taskId, handle.path);
+            return;
+          }
+        } else {
+          console.log(`[agent ${this.agentId}] Discovered ${discoveredFiles.length} files: ${discoveredFiles.join(", ")}`);
+          // Request locks for discovered files (or grant all in standalone mode)
+          const grantedFiles = this.socketClient
+            ? await this.socketClient.requestLocksAsync(taskId, discoveredFiles)
+            : discoveredFiles;
+          console.log(`[agent ${this.agentId}] Locks granted for: ${grantedFiles.join(", ")}`);
+
+          this.activeLockFiles = grantedFiles;
+          // Update task with discovered files
+          task = { ...task, target_files: grantedFiles };
+        }
+      } else if (task.target_files.length === 0) {
+        // No target files and no discovery executor.
+        // In standalone mode, proceed to open-ended session.
+        if (!this.socketClient) {
+          console.log(`[agent ${this.agentId}] No target files — opening open-ended session.`);
+          this.activeLockFiles = [];
+          // fall through to main executor below
+        } else {
+          console.log(`[agent ${this.agentId}] Read-only task (no target files, no discovery) — completing.`);
           this.completeReadOnlyTask(taskId, handle.path);
           return;
         }
-
-        console.log(`[agent ${this.agentId}] Discovered ${discoveredFiles.length} files: ${discoveredFiles.join(", ")}`);
-
-        // Request locks for discovered files (or grant all in standalone mode)
-        const grantedFiles = this.socketClient
-          ? await this.socketClient.requestLocksAsync(taskId, discoveredFiles)
-          : discoveredFiles;
-        console.log(`[agent ${this.agentId}] Locks granted for: ${grantedFiles.join(", ")}`);
-
-        this.activeLockFiles = grantedFiles;
-        // Update task with discovered files
-        task = { ...task, target_files: grantedFiles };
-      } else if (task.target_files.length === 0) {
-        // No target files and no discovery executor — read-only by definition
-        console.log(`[agent ${this.agentId}] Read-only task (no target files, no discovery) — completing.`);
-        this.completeReadOnlyTask(taskId, handle.path);
-        return;
       } else {
         this.activeLockFiles = task.target_files.map((f) => f); // copy
       }
@@ -474,6 +489,7 @@ export class AgentWorker {
    * Returns an array of conflicted file paths, or empty if successful.
    */
   private preCommitRebase(worktreePath: string): string[] {
+    let hadStash = false;
     try {
       // 1. Stash any uncommitted changes
       const stashOutput = execSync('git stash push -m "laol-pre-commit-rebase"', {
@@ -482,7 +498,7 @@ export class AgentWorker {
         timeout: 5000,
       }).toString().trim();
 
-      const hadStash = !stashOutput.includes("No local changes to save");
+      hadStash = !stashOutput.includes("No local changes to save");
 
       // 2. Fetch latest
       execSync("git fetch origin main", {
@@ -563,6 +579,14 @@ export class AgentWorker {
       return [];
     } catch (err) {
       console.warn(`[agent ${this.agentId}] Pre-commit rebase error: ${err}`);
+      // Restore stashed changes so commitChanges() can still commit them
+      if (hadStash) {
+        try {
+          execSync("git stash pop", { cwd: worktreePath, stdio: "pipe", timeout: 5000 });
+        } catch {
+          // stash pop may conflict — best effort
+        }
+      }
       return [];
     }
   }

@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execSync } from "node:child_process";
 import { LaolConfigSchema } from "./data/schemas";
 import type { LaolConfig } from "./data/models";
 
@@ -200,5 +201,57 @@ export function resolveRepoRoot(cwd?: string): string {
       return cwd ?? process.cwd();
     }
     dir = parent;
+  }
+}
+
+/**
+ * Ensure a git repository exists at the given root.
+ * If `.git/` already exists, this is a no-op.
+ * If not, runs `git init`, configures local user, and creates an initial commit
+ * (required for git worktree operations).
+ *
+ * Returns `{ initialized: true }` if a new repo was created,
+ * `{ initialized: false }` if one already existed or on failure.
+ */
+export function ensureGitRepo(repoRoot: string): { initialized: boolean; error?: string } {
+  const gitDir = path.join(repoRoot, ".git");
+  if (fs.existsSync(gitDir)) {
+    return { initialized: false };
+  }
+
+  try {
+    execSync("git init --initial-branch=main", { cwd: repoRoot, stdio: "pipe", timeout: 10_000 });
+    execSync('git config user.name "LAOL"', { cwd: repoRoot, stdio: "pipe", timeout: 5_000 });
+    execSync('git config user.email "laol@local"', { cwd: repoRoot, stdio: "pipe", timeout: 5_000 });
+
+    // Rename default branch to main if git version < 2.28 (no --initial-branch support)
+    try {
+      execSync("git branch -M main", { cwd: repoRoot, stdio: "pipe", timeout: 5_000 });
+    } catch {
+      // Already on main or rename not needed
+    }
+
+    // Create initial commit — required for git worktree add
+    try {
+      execSync("git add -A", { cwd: repoRoot, stdio: "pipe", timeout: 10_000 });
+      execSync('git commit -m "Initial commit (LAOL auto-init)"', {
+        cwd: repoRoot,
+        stdio: "pipe",
+        timeout: 10_000,
+      });
+    } catch {
+      // Nothing to commit (empty directory) — use allow-empty
+      execSync('git commit --allow-empty -m "Initial commit (LAOL auto-init)"', {
+        cwd: repoRoot,
+        stdio: "pipe",
+        timeout: 10_000,
+      });
+    }
+
+    console.warn("[laol] Git repository auto-initialized (required for agent operations)");
+    return { initialized: true };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { initialized: false, error: message };
   }
 }

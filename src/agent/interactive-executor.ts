@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, execSync, type ChildProcess } from "node:child_process";
 import type { Task, LaolConfig, InteractiveResult } from "../data/models";
 
 const WIN32 = process.platform === "win32";
@@ -285,8 +285,15 @@ export class InteractiveTerminalOpener {
       `laol_session_${this.agentId}.bat`
     );
 
+    // Log file for debugging terminal issues — written to %TEMP%
+    const logPath = path.join(
+      process.env.TEMP ?? this.sessionDir,
+      `laol_session_${this.agentId}.log`
+    );
+
     const lines: string[] = [];
     lines.push("@echo off");
+    lines.push("setlocal enabledelayedexpansion");
     lines.push("title LAOL Agent - " + _task.description.slice(0, 50));
     lines.push("cls");
     lines.push("echo ========================================");
@@ -303,14 +310,49 @@ export class InteractiveTerminalOpener {
     lines.push("echo  Closing this window directly may lose your work.");
     lines.push("echo ========================================");
     lines.push("echo.");
+    // Log start
+    lines.push(
+      `echo [%date% %time%] LAOL session started >> "${logPath}"`
+    );
+    // Verify claude is available before trying to run it
+    lines.push("where /q " + this.binaryPath + " >nul 2>nul");
+    lines.push("if %ERRORLEVEL% neq 0 (");
+    lines.push("  echo [ERROR] Claude Code CLI not found: " + this.binaryPath);
+    lines.push("  echo.");
+    lines.push("  echo Install it with: npm install -g @anthropic-ai/claude-code");
+    lines.push("  echo.");
+    lines.push(
+      `  echo [%date% %time%] ERROR: ${this.binaryPath} not found >> "${logPath}"`
+    );
+    lines.push("  pause");
+    lines.push("  exit /b 1");
+    lines.push(")");
+    lines.push(
+      `echo [%date% %time%] ${this.binaryPath} found in PATH, launching... >> "${logPath}"`
+    );
     // Push working directory, then run Claude
     lines.push("pushd " + worktreePath);
+    lines.push(
+      `echo [%date% %time%] CWD: %cd% >> "${logPath}"`
+    );
+    lines.push(
+      `echo [%date% %time%] Running: ${this.binaryPath} >> "${logPath}"`
+    );
     lines.push(this.binaryPath);
-    // After Claude exits, delete sentinel and restore directory
-    lines.push("del /f /q " + shellEscape(sentinelPath));
+    lines.push(
+      `echo [%date% %time%] ${this.binaryPath} exited with code %%ERRORLEVEL%% >> "${logPath}"`
+    );
+    // After Claude exits, delete sentinel.
+    // Use double-quote escaping for Windows (cmd.exe does not understand single quotes).
+    lines.push(`del /f /q "${sentinelPath}"`);
+    lines.push(
+      `echo [%date% %time%] Sentinel deleted >> "${logPath}"`
+    );
     lines.push("popd");
     lines.push("echo.");
-    lines.push("echo [LAOL] Session ended. You may close this window.");
+    lines.push("echo [LAOL] Session ended.");
+    // Keep window open so user can see output, even on error
+    lines.push("pause");
     lines.push("exit");
 
     fs.writeFileSync(wrapperPath, lines.join("\r\n"), "utf-8");
@@ -401,17 +443,32 @@ export class InteractiveTerminalOpener {
   }
 
   private spawnWindowsTerminal(wrapperPath: string, worktreePath: string): ChildProcess {
-    // Wrap the .bat path in double-quotes for spaces, then use start /wait
-    // The outer cmd /c blocks until the inner cmd (opened by start) exits.
-    // This allows us to use the child's 'close' event as the primary signal.
-    const cmdStr = [
-      `start "LAOL Agent" /wait`,
-      `cmd /d /s /c ""${wrapperPath}""`,
-    ].join(" ");
+    // Windows quoting is deeply hostile to nested invocation. Node.js escapes
+    // arguments for CreateProcess which collide with cmd.exe /c parsing which
+    // collide with start's own syntax. Every attempt to pass the start command
+    // as a spawn argument produces broken quoting (empty titles become escaped
+    // quotes, paths get mangled to "\\", etc.).
+    //
+    // The reliable approach: write the start command into a launcher .bat file
+    // whose content is exact and NOT subject to spawn-time escaping. Then spawn
+    // cmd.exe /c launcher.bat — the launcher path has no spaces so it survives
+    // the single layer of quoting intact.
+    const launcherPath = path.join(
+      this.sessionDir,
+      `launcher_${this.agentId}_${Date.now()}.bat`
+    );
+    const launcherLines = [
+      "@echo off",
+      `start "LAOL Agent" /wait "${wrapperPath}"`,
+      // Clean up the launcher after start returns
+      `del /f /q "${launcherPath}"`,
+    ];
+    fs.writeFileSync(launcherPath, launcherLines.join("\r\n"), "utf-8");
 
-    console.log(`[interactive] Launching: ${cmdStr}`);
+    console.log(`[interactive] Launching via launcher: ${launcherPath}`);
+    console.log(`[interactive]   -> start "LAOL Agent" /wait "${wrapperPath}"`);
 
-    const child = spawn("cmd.exe", ["/d", "/s", "/c", cmdStr], {
+    const child = spawn("cmd.exe", ["/d", "/s", "/c", launcherPath], {
       cwd: worktreePath,
       stdio: "ignore",
       detached: false,
@@ -649,32 +706,19 @@ export class InteractiveTerminalOpener {
   // ---- Private: Binary check ----
 
   private binaryExists(): boolean {
-    const binary = this.binaryPath;
-    const args = ["--version"];
-
     try {
-      let child: ChildProcess;
-
       if (WIN32) {
-        // Use cmd.exe wrapper for Windows (same as claude-executor.ts)
-        child = spawn("cmd.exe", ["/d", "/s", "/c", `"${binary}" --version`], {
+        execSync(`where "${this.binaryPath}" 2>nul`, {
           stdio: "pipe",
           timeout: 5000,
         });
       } else {
-        child = spawn(binary, args, {
+        execSync(`command -v "${this.binaryPath}"`, {
           stdio: "pipe",
           timeout: 5000,
         });
       }
-
-      const ok = child.pid !== undefined;
-      try {
-        child.kill();
-      } catch {
-        // already exited
-      }
-      return ok;
+      return true;
     } catch {
       return false;
     }
